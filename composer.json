@@ -1,0 +1,31 @@
+{
+  "name": "dsplat/multi-tenant-saas-module-yunxiao",
+  "description": "云效集成",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": "^8.3",
+    "dsplat/multi-tenant-saas": "^1.0 || ^2.0 || ^3.0",
+    "dsplat/multi-tenant-saas-base": "^3.4"
+  },
+  "autoload": {
+    "psr-4": {
+      "MultiTenantSaas\\Modules\\Yunxiao\\": ""
+    }
+  },
+  "extra": {
+    "saas": {
+      "name": "yunxiao",
+      "priority": 300,
+      "dependencies": [
+        "integration"
+      ],
+      "conflicts": [],
+      "requires_core": ">=3.1.0 <4.0.0",
+      "provider": "MultiTenantSaas\\Modules\\Yunxiao\\YunxiaoServiceProvider",
+      "tenant_toggleable": true,
+      "module_loadable": true,
+      "default_tenant_enabled": false
+    }
+  }
+}
