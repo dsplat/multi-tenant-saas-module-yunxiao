@@ -40,6 +40,24 @@
 - `common.yunxiao.member.sync`
 - 兼容别名：`list` / `read` → 查看；`create` / `update` / `delete` → 管理
 
+## Region OpenAPI 契约（实例域）
+
+实例域（`*.devops.aliyuncs.com`）不拼 `organizationId`，且 projex 的列表语义是 `:search` POST + 复数集合 GET。
+`GET /projects`、`GET /templates` 在实例域返回 404（issue #17，v3.10.6 及以前踩中）。
+
+| 能力 | 方法 / 路径（相对 `/oapi/v1/projex`） | 备注 |
+|---|---|---|
+| 项目列表 | `POST /projects:search` | body `page` / `perPage`；返回数组 |
+| 项目详情 | `GET /projects/{id}` | |
+| 建项目 | `POST /projects` | `templateId` 取 `projectTemplates` 的 `id`；实例版 create 契约待实测（见 BL-183） |
+| 模板列表 | `GET /projectTemplates` | 返回 `[{id,name,type}]` |
+| 工作项列表 | `POST /workitems:search` | body `spaceId` / `category`=`Req,Task,Bug` / `page` / `perPage` / `orderBy` / `sort`；总数在 `x-total` 响应头 |
+| 工作项详情 / 更新 | `GET` / `PUT /workitems/{id}` | |
+| 工作项评论 | `POST /workitems/{id}/comments` | body `content` |
+| 项目成员 | `GET /projects/{id}/members` | 实例路径待实测确认（与 org 契约仅差 org 段） |
+
+增量同步把游标（毫秒时间戳或 ISO）转成 `conditions`：`gmtModified` `BETWEEN [cursor, now]`，按 `gmtModified desc` 翻页。
+
 ## 同步与写回
 
 - 工作项同步按连接 + `integration_sync_cursors(resource=workitems)` 增量拉取，限流退避后重试；超过 `stale_minutes` 的投影标记为 stale。

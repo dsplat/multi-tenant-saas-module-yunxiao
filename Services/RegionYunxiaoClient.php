@@ -23,6 +23,11 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 {
     private const PATH_PREFIX = '/oapi/v1/projex';
 
+    /**
+     * 工作项搜索的默认大类（公开 projex 契约：需求 / 任务 / 缺陷）。
+     */
+    private const WORKITEM_CATEGORIES = 'Req,Task,Bug';
+
     public function __construct(
         private readonly Factory $http,
         private readonly YunxiaoUrlGuard $guard,
@@ -30,10 +35,11 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 
     public function listProjects(IntegrationConnection $connection, array $query = []): array
     {
-        $data = $this->request($connection, 'GET', self::PATH_PREFIX . '/projects', array_filter([
-            'page' => $query['page'] ?? 1,
-            'perPage' => $query['per_page'] ?? 50,
-        ], static fn ($value): bool => $value !== null));
+        // 实例域没有 `GET /projects`（404），列表语义是 `POST projects:search`。
+        $data = $this->request($connection, 'POST', self::PATH_PREFIX . '/projects:search', [], [
+            'page' => max(1, (int) ($query['page'] ?? 1)),
+            'perPage' => max(1, (int) ($query['per_page'] ?? 50)),
+        ]);
 
         return array_values(array_map(
             fn (array $item): array => $this->normalizeProject($item),
@@ -65,7 +71,8 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 
     public function listTemplates(IntegrationConnection $connection): array
     {
-        $data = $this->request($connection, 'GET', self::PATH_PREFIX . '/templates');
+        // 实例域模板集合是 `projectTemplates`；`/templates` 返回 404。
+        $data = $this->request($connection, 'GET', self::PATH_PREFIX . '/projectTemplates');
 
         return array_values(array_map(
             fn (array $item): array => $this->normalizeTemplate($item),
@@ -75,15 +82,31 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 
     public function listWorkitems(IntegrationConnection $connection, string $externalProjectId, array $query = []): array
     {
-        $data = $this->request(
+        $page = max(1, (int) ($query['page'] ?? 1));
+        $perPage = max(1, (int) ($query['per_page'] ?? (int) config('yunxiao.api.page_size', 100)));
+
+        // 实例域工作项列表是 `POST workitems:search`（项目 GET 子资源不存在）。
+        $body = [
+            'spaceId' => $externalProjectId,
+            'category' => self::WORKITEM_CATEGORIES,
+            'page' => $page,
+            'perPage' => $perPage,
+            'orderBy' => 'gmtModified',
+            'sort' => 'desc',
+        ];
+
+        $conditions = $this->workitemConditions($query['updated_since'] ?? null);
+
+        if ($conditions !== null) {
+            $body['conditions'] = $conditions;
+        }
+
+        [$data, $headers] = $this->requestWithMeta(
             $connection,
-            'GET',
-            self::PATH_PREFIX . '/projects/' . rawurlencode($externalProjectId) . '/workitems',
-            array_filter([
-                'page' => $query['page'] ?? 1,
-                'perPage' => $query['per_page'] ?? (int) config('yunxiao.api.page_size', 100),
-                'updatedSince' => $query['updated_since'] ?? null,
-            ], static fn ($value): bool => $value !== null),
+            'POST',
+            self::PATH_PREFIX . '/workitems:search',
+            [],
+            $body,
         );
 
         $items = array_values(array_map(
@@ -91,10 +114,14 @@ class RegionYunxiaoClient implements YunxiaoClientContract
             $this->itemsOf($data),
         ));
 
+        // 搜索接口返回数组，总数在 `x-total` 响应头；没有该头时按「整页即可能还有下一页」。
+        $total = $this->totalFromHeaders($headers);
+        $hasMore = $total !== null ? $page * $perPage < $total : count($items) >= $perPage;
+
         return [
             'items' => $items,
-            'has_more' => (bool) ($data['hasMore'] ?? $data['has_more'] ?? false),
-            'total' => isset($data['total']) ? (int) $data['total'] : null,
+            'has_more' => $hasMore,
+            'total' => $total,
         ];
     }
 
@@ -143,7 +170,7 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 
         return array_values(array_map(
             static fn (array $item): array => [
-                'id' => (string) ($item['id'] ?? $item['userId'] ?? $item['user_id'] ?? ''),
+                'id' => (string) ($item['id'] ?? $item['identifier'] ?? $item['userId'] ?? $item['user_id'] ?? $item['account'] ?? ''),
                 'name' => (string) ($item['name'] ?? $item['displayName'] ?? $item['display_name'] ?? ''),
             ],
             $this->itemsOf($data),
@@ -156,6 +183,23 @@ class RegionYunxiaoClient implements YunxiaoClientContract
      * @return array<string, mixed>
      */
     private function request(
+        IntegrationConnection $connection,
+        string $method,
+        string $path,
+        array $query = [],
+        ?array $body = null,
+    ): array {
+        return $this->requestWithMeta($connection, $method, $path, $query, $body)[0];
+    }
+
+    /**
+     * 同 request()，并返回响应头（列表分页用 `x-total`）。
+     *
+     * @param  array<string, mixed>  $query
+     * @param  array<string, mixed>|null  $body
+     * @return array{0: array<string, mixed>, 1: array<string, array<string>>}
+     */
+    private function requestWithMeta(
         IntegrationConnection $connection,
         string $method,
         string $path,
@@ -207,7 +251,82 @@ class RegionYunxiaoClient implements YunxiaoClientContract
             throw new YunxiaoApiException('云效 API 返回内容无法解析', 502, YunxiaoApiException::REASON_UNKNOWN);
         }
 
-        return $this->unwrap($json);
+        return [$this->unwrap($json), $response->headers()];
+    }
+
+    /**
+     * 增量游标 → projex 搜索条件（日期条件用毫秒时间戳，与公开 projex 契约一致）。
+     *
+     * @return string|null JSON 字符串；无有效游标时返回 null（首轮全量）
+     */
+    private function workitemConditions(mixed $updatedSince): ?string
+    {
+        $from = $this->toMilliseconds($updatedSince);
+
+        if ($from === null) {
+            return null;
+        }
+
+        $condition = [
+            'className' => 'date',
+            'fieldIdentifier' => 'gmtModified',
+            'format' => 'date',
+            'operator' => 'BETWEEN',
+            'value' => [(string) $from],
+            'toValue' => (string) (int) round(microtime(true) * 1000),
+        ];
+
+        // 契约形状：conditionGroups 是「组」列表，每个组是「条件」列表。
+        $json = json_encode([
+            'conditionGroups' => [[$condition]],
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        return $json === false ? null : $json;
+    }
+
+    /**
+     * 游标既可能是毫秒/秒时间戳，也可能是 ISO 时间串；统一成毫秒。
+     */
+    private function toMilliseconds(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value > 0 ? ($value < 100_000_000_000 ? $value * 1000 : $value) : null;
+        }
+
+        $text = trim((string) $value);
+
+        if ($text === '') {
+            return null;
+        }
+
+        if (preg_match('/^\d+$/', $text) === 1) {
+            $int = (int) $text;
+
+            return $int > 0 ? ($int < 100_000_000_000 ? $int * 1000 : $int) : null;
+        }
+
+        $timestamp = strtotime($text);
+
+        return $timestamp === false ? null : $timestamp * 1000;
+    }
+
+    /**
+     * @param  array<string, array<string>>  $headers
+     */
+    private function totalFromHeaders(array $headers): ?int
+    {
+        foreach ($headers as $name => $values) {
+            if (strtolower((string) $name) !== 'x-total') {
+                continue;
+            }
+
+            $raw = is_array($values) ? (string) ($values[0] ?? '') : (string) $values;
+            $raw = trim($raw);
+
+            return preg_match('/^\d+$/', $raw) === 1 ? (int) $raw : null;
+        }
+
+        return null;
     }
 
     /**
