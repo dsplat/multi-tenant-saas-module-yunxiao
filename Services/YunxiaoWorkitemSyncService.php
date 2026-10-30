@@ -749,6 +749,18 @@ class YunxiaoWorkitemSyncService
             return null;
         }
 
+        // 云效 Region 返回毫秒整数（如 1767225600000）；当作日期字符串会让 Carbon
+        // 解析出 1767 年这类错误时刻，水位与投影时间会一起飘。
+        if (is_int($value) || (is_string($value) && preg_match('/^\d+$/', trim($value)) === 1)) {
+            $int = (int) $value;
+
+            if ($int <= 0) {
+                return null;
+            }
+
+            return Carbon::createFromTimestampMs($int < 100_000_000_000 ? $int * 1000 : $int, 'UTC');
+        }
+
         try {
             return Carbon::parse((string) $value);
         } catch (\Throwable) {
