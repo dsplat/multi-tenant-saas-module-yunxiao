@@ -29,7 +29,7 @@ use MultiTenantSaas\Modules\Yunxiao\Models\YunxiaoWorkitem;
  *
  * - 增量：按项目 + updatedSince，游标落 IntegrationSyncCursorService（resource=workitems）；
  * - 一次同步一条 IntegrationSyncRun；
- * - 分页 + 429 限流退避；某页失败不回滚已成功页，游标只推进到成功页的最大更新时间；
+ * - 分页 + 429 限流退避；某页失败不回滚已成功页，但整个区间未处理完就不推进水位（E1）；
  * - upsert 以 serialNumber 为对账键；未知状态原样保存并标 metadata.unmapped=true，不猜测；
  * - 详情实时拉取失败/超时回退缓存，并标 metadata.stale=true。
  */
@@ -73,6 +73,8 @@ class YunxiaoWorkitemSyncService
                 'skipped' => 0,
                 'failed' => 0,
                 'partial' => false,
+                'status' => 'complete',
+                'projects_detail' => [],
                 'errors' => [],
                 'cursor' => null,
             ];
@@ -81,6 +83,8 @@ class YunxiaoWorkitemSyncService
                 foreach ($projects as $project) {
                     $this->syncProject($tenantId, $connection, $project, $resource, $stats, true);
                 }
+
+                $stats['status'] = $stats['partial'] ? 'partial' : 'complete';
 
                 return $stats;
             }
@@ -103,6 +107,8 @@ class YunxiaoWorkitemSyncService
 
                 throw $e;
             }
+
+            $stats['status'] = $stats['partial'] ? 'partial' : 'complete';
 
             if ($stats['pages'] === 0 && $stats['errors'] !== []) {
                 $this->runs->fail($tenantId, (int) $run->run_id, (string) $stats['errors'][0], $stats);
@@ -291,7 +297,12 @@ class YunxiaoWorkitemSyncService
         $meta = (array) ($cursor?->cursor_meta ?? []);
         $perProject = (array) ($meta['projects'] ?? []);
         $projectKey = (string) $project->external_project_id;
-        $updatedSince = isset($perProject[$projectKey]) ? (string) $perProject[$projectKey] : null;
+        $previousCursor = isset($perProject[$projectKey]) ? (string) $perProject[$projectKey] : null;
+
+        // E1：整轮同步固定 [lower, upper]，所有分页共用同一上界；逐页取 now 会让分页随远端写入漂移。
+        $upperBoundMs = (int) round(microtime(true) * 1000);
+        $overlapMs = max(0, (int) config('yunxiao.sync.watermark_overlap_ms', 300000));
+        $updatedSince = $this->lowerBound($previousCursor, $overlapMs);
 
         $pageSize = (int) config('yunxiao.api.page_size', 100);
         $maxPages = (int) config('yunxiao.api.max_pages', 100);
@@ -299,12 +310,16 @@ class YunxiaoWorkitemSyncService
         $knownStatuses = $this->templates->knownStatusIdsForProject($tenantId, $project);
         $maxUpdated = null;
         $page = 1;
+        $pagesBefore = (int) $stats['pages'];
+        $complete = true;
+        $reason = null;
 
         while ($page <= $maxPages) {
             try {
-                $result = $this->fetchPage($connection, $project, $page, $pageSize, $updatedSince, $maxRetries);
+                $result = $this->fetchPage($connection, $project, $page, $pageSize, $updatedSince, $upperBoundMs, $maxRetries);
             } catch (\Throwable $e) {
-                $stats['partial'] = true;
+                $complete = false;
+                $reason ??= 'page_failed';
                 $stats['errors'][] = sprintf('项目 %s 第 %d 页：%s', $project->external_project_id, $page, $this->safeError($e));
 
                 break;
@@ -324,6 +339,8 @@ class YunxiaoWorkitemSyncService
                     $outcome = $this->projectItem($tenantId, $connection, $project, (array) $payload, $knownStatuses, $dryRun);
                 } catch (\Throwable $e) {
                     $stats['failed']++;
+                    $complete = false;
+                    $reason ??= 'item_failed';
                     $stats['errors'][] = sprintf('项目 %s 工作项：%s', $project->external_project_id, $this->safeError($e));
 
                     continue;
@@ -337,9 +354,10 @@ class YunxiaoWorkitemSyncService
 
                 $stats[$outcome['created'] ? 'created' : 'updated']++;
 
-                if ($outcome['updated_at'] !== null
-                    && ($maxUpdated === null || $outcome['updated_at'] > $maxUpdated)) {
-                    $maxUpdated = $outcome['updated_at'];
+                $itemUpdatedAt = $this->toTimestamp($outcome['updated_at']);
+
+                if ($itemUpdatedAt !== null && ($maxUpdated === null || $itemUpdatedAt->greaterThan($maxUpdated))) {
+                    $maxUpdated = $itemUpdatedAt;
                 }
             }
 
@@ -348,29 +366,115 @@ class YunxiaoWorkitemSyncService
             }
 
             $page++;
-        }
 
-        if ($maxUpdated !== null) {
-            $perProject[$projectKey] = $maxUpdated;
-        }
-
-        if (! $dryRun) {
-            $project->last_synced_at = now();
-            $project->save();
-
-            if ($maxUpdated !== null) {
-                $meta['projects'] = $perProject;
-                $current = (string) ($cursor?->cursor_value ?? '');
-                $cursorValue = $current === '' || $maxUpdated > $current ? $maxUpdated : $current;
-                $this->cursors->advance(
-                    $tenantId,
-                    (int) $connection->connection_id,
-                    $resource,
-                    $cursorValue,
-                    $meta,
-                );
-                $stats['cursor'] = $cursorValue;
+            if ($page > $maxPages) {
+                // 仍有下一页但到达页数上限：本区间未取完，不得推进水位。
+                $complete = false;
+                $reason ??= 'page_limit';
+                $stats['errors'][] = sprintf('项目 %s 分页达到上限 %d，仍有未取完的工作项', $project->external_project_id, $maxPages);
             }
+        }
+
+        if (! $complete) {
+            $stats['partial'] = true;
+        }
+
+        $stats['projects_detail'][$projectKey] = [
+            'status' => $complete ? 'complete' : 'partial',
+            'reason' => $reason ?? ($complete ? null : 'incomplete'),
+            'pages' => (int) $stats['pages'] - $pagesBefore,
+            'lower_bound' => $updatedSince,
+            'upper_bound' => $upperBoundMs,
+        ];
+
+        if ($dryRun) {
+            return;
+        }
+
+        $project->last_synced_at = now();
+        $project->save();
+
+        if (! $complete || $maxUpdated === null) {
+            // 未完整处理整个区间：保留旧水位，下一轮从原 lower 重取（幂等 upsert，不允许越过缺口）。
+            return;
+        }
+
+        $cursorValue = $this->advanceCursor($maxUpdated, (string) ($cursor?->cursor_value ?? ''), $perProject, $projectKey);
+
+        // 并发保护：本轮开始时读到的游标若已被其它 worker 推进，本轮不得覆盖新水位。
+        $latest = $this->cursors->get($tenantId, (int) $connection->connection_id, $resource);
+
+        if ((string) ($latest?->cursor_value ?? '') !== (string) ($cursor?->cursor_value ?? '')) {
+            $stats['partial'] = true;
+            $stats['projects_detail'][$projectKey]['status'] = 'partial';
+            $stats['projects_detail'][$projectKey]['reason'] = 'concurrent_sync';
+            $stats['errors'][] = sprintf('项目 %s 检测到并发同步，本轮水位未推进', $projectKey);
+
+            return;
+        }
+
+        $meta['projects'] = $perProject;
+
+        $this->cursors->advance(
+            $tenantId,
+            (int) $connection->connection_id,
+            $resource,
+            $cursorValue,
+            $meta,
+        );
+
+        $stats['cursor'] = $cursorValue;
+    }
+
+    /**
+     * 计算本轮下界：游标回退一个重叠窗口，覆盖「同时间戳多记录」与分页平移的风险。
+     */
+    private function lowerBound(?string $cursorValue, int $overlapMs): ?string
+    {
+        $at = $this->toTimestamp($cursorValue);
+
+        if ($at === null) {
+            return null;
+        }
+
+        return $at->copy()->subMilliseconds($overlapMs)->utc()->toIso8601String();
+    }
+
+    /**
+     * 水位只前进：按时间戳比较，不比较不同时区的 ISO 字符串字典序。
+     *
+     * @param  array<string, mixed>  $perProject
+     */
+    private function advanceCursor(Carbon $maxUpdated, string $current, array &$perProject, string $projectKey): string
+    {
+        $currentAt = $this->toTimestamp($current);
+
+        if ($currentAt !== null && ! $maxUpdated->greaterThan($currentAt)) {
+            return $current;
+        }
+
+        $cursorValue = $maxUpdated->copy()->utc()->toIso8601String();
+        $perProject[$projectKey] = $cursorValue;
+
+        return $cursorValue;
+    }
+
+    private function toTimestamp(mixed $value): ?Carbon
+    {
+        if ($value instanceof Carbon) {
+            return $value;
+        }
+
+        $text = trim((string) $value);
+
+        if ($text === '') {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($text);
+        } catch (\Throwable) {
+            return null;
         }
     }
 
@@ -383,6 +487,7 @@ class YunxiaoWorkitemSyncService
         int $page,
         int $pageSize,
         ?string $updatedSince,
+        int $upperBoundMs,
         int $maxRetries,
     ): array {
         $attempt = 0;
@@ -393,6 +498,7 @@ class YunxiaoWorkitemSyncService
                     'page' => $page,
                     'per_page' => $pageSize,
                     'updated_since' => $updatedSince,
+                    'updated_until' => $upperBoundMs,
                 ], static fn ($value): bool => $value !== null && $value !== ''));
             } catch (YunxiaoApiException $e) {
                 if ($e->reason === YunxiaoApiException::REASON_RATE_LIMITED && $attempt < $maxRetries) {

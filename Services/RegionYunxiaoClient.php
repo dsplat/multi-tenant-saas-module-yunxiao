@@ -95,7 +95,7 @@ class RegionYunxiaoClient implements YunxiaoClientContract
             'sort' => 'desc',
         ];
 
-        $conditions = $this->workitemConditions($query['updated_since'] ?? null);
+        $conditions = $this->workitemConditions($query['updated_since'] ?? null, $query['updated_until'] ?? null);
 
         if ($conditions !== null) {
             $body['conditions'] = $conditions;
@@ -257,9 +257,12 @@ class RegionYunxiaoClient implements YunxiaoClientContract
     /**
      * 增量游标 → projex 搜索条件（日期条件用毫秒时间戳，与公开 projex 契约一致）。
      *
+     * E1：`$updatedUntil` 由调用方在整轮同步开始时固定，缺省才取当前时间；
+     * 逐页取 now 会让分页在同步过程中随远端写入漂移，是漏数根因之一。
+     *
      * @return string|null JSON 字符串；无有效游标时返回 null（首轮全量）
      */
-    private function workitemConditions(mixed $updatedSince): ?string
+    private function workitemConditions(mixed $updatedSince, mixed $updatedUntil = null): ?string
     {
         $from = $this->toMilliseconds($updatedSince);
 
@@ -267,13 +270,15 @@ class RegionYunxiaoClient implements YunxiaoClientContract
             return null;
         }
 
+        $until = $this->toMilliseconds($updatedUntil) ?? (int) round(microtime(true) * 1000);
+
         $condition = [
             'className' => 'date',
             'fieldIdentifier' => 'gmtModified',
             'format' => 'date',
             'operator' => 'BETWEEN',
             'value' => [(string) $from],
-            'toValue' => (string) (int) round(microtime(true) * 1000),
+            'toValue' => (string) $until,
         ];
 
         // 契约形状：conditionGroups 是「组」列表，每个组是「条件」列表。
