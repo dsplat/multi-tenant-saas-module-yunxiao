@@ -59,12 +59,15 @@ class YunxiaoWorkitemSyncService
                 : (int) $projects[0]->connection_id;
             $connection = $this->connections->find($tenantId, $connectionId);
             $resource = (string) config('yunxiao.sync.resource', 'workitems');
+            $range = $this->explicitRange($options);
 
             $stats = [
                 'tenant_id' => $tenantId,
                 'connection_id' => $connectionId,
                 'resource' => $resource,
                 'dry_run' => $dryRun,
+                'backfill' => $range['since'] !== null || $range['until'] !== null,
+                'range' => $range,
                 'projects' => count($projects),
                 'pages' => 0,
                 'fetched' => 0,
@@ -81,7 +84,7 @@ class YunxiaoWorkitemSyncService
 
             if ($dryRun) {
                 foreach ($projects as $project) {
-                    $this->syncProject($tenantId, $connection, $project, $resource, $stats, true);
+                    $this->syncProject($tenantId, $connection, $project, $resource, $stats, true, $range);
                 }
 
                 $stats['status'] = $stats['partial'] ? 'partial' : 'complete';
@@ -99,7 +102,7 @@ class YunxiaoWorkitemSyncService
 
             try {
                 foreach ($projects as $project) {
-                    $this->syncProject($tenantId, $connection, $project, $resource, $stats, false);
+                    $this->syncProject($tenantId, $connection, $project, $resource, $stats, false, $range);
                 }
             } catch (\Throwable $e) {
                 $stats['errors'][] = $this->safeError($e);
@@ -284,6 +287,7 @@ class YunxiaoWorkitemSyncService
 
     /**
      * @param  array<string, mixed>  $stats
+     * @param  array{since:?string,until:?string}  $range
      */
     private function syncProject(
         int $tenantId,
@@ -292,6 +296,7 @@ class YunxiaoWorkitemSyncService
         string $resource,
         array &$stats,
         bool $dryRun,
+        array $range = [],
     ): void {
         $cursor = $this->cursors->get($tenantId, (int) $connection->connection_id, $resource);
         $meta = (array) ($cursor?->cursor_meta ?? []);
@@ -300,9 +305,15 @@ class YunxiaoWorkitemSyncService
         $previousCursor = isset($perProject[$projectKey]) ? (string) $perProject[$projectKey] : null;
 
         // E1：整轮同步固定 [lower, upper]，所有分页共用同一上界；逐页取 now 会让分页随远端写入漂移。
-        $upperBoundMs = (int) round(microtime(true) * 1000);
+        $rangeSince = $range['since'] ?? null;
+        $rangeUntil = $range['until'] ?? null;
+        $backfill = $rangeSince !== null || $rangeUntil !== null;
+
+        $upperBoundMs = $rangeUntil !== null
+            ? (int) (strtotime($rangeUntil) * 1000)
+            : (int) round(microtime(true) * 1000);
         $overlapMs = max(0, (int) config('yunxiao.sync.watermark_overlap_ms', 300000));
-        $updatedSince = $this->lowerBound($previousCursor, $overlapMs);
+        $updatedSince = $rangeSince ?? $this->lowerBound($previousCursor, $overlapMs);
 
         $pageSize = (int) config('yunxiao.api.page_size', 100);
         $maxPages = (int) config('yunxiao.api.max_pages', 100);
@@ -399,6 +410,11 @@ class YunxiaoWorkitemSyncService
             return;
         }
 
+        if ($backfill) {
+            // 显式区间回补只补数据，不移动常规水位，避免把历史窗口误当成最新进度。
+            return;
+        }
+
         $cursorValue = $this->advanceCursor($maxUpdated, (string) ($cursor?->cursor_value ?? ''), $perProject, $projectKey);
 
         // 并发保护：本轮开始时读到的游标若已被其它 worker 推进，本轮不得覆盖新水位。
@@ -424,6 +440,23 @@ class YunxiaoWorkitemSyncService
         );
 
         $stats['cursor'] = $cursorValue;
+    }
+
+    /**
+     * 显式回补区间（运维 dry-run/重扫用）：不移动常规水位。
+     *
+     * @param  array<string, mixed>  $options
+     * @return array{since:?string,until:?string}
+     */
+    private function explicitRange(array $options): array
+    {
+        $since = $this->toTimestamp($options['since'] ?? null);
+        $until = $this->toTimestamp($options['until'] ?? null);
+
+        return [
+            'since' => $since?->copy()->utc()->toIso8601String(),
+            'until' => $until?->copy()->utc()->toIso8601String(),
+        ];
     }
 
     /**
