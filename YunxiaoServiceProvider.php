@@ -89,14 +89,14 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         foreach (self::CAPABILITIES as $suffix => [$permission, $description]) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.' . $suffix,
+                'common.yunxiao.'.$suffix,
             );
         }
 
         foreach (self::COMPAT_ALIASES as $action => $permission) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.' . $action,
+                'common.yunxiao.'.$action,
             );
         }
 
@@ -261,7 +261,12 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
             return;
         }
 
-        $this->app->make(SceneRegistryContract::class)
-            ->registerScene('yunxiao', '云效集成', 'Menu', '云效集成管理', 100);
+        $registry = $this->app->make(SceneRegistryContract::class);
+
+        $registry->registerScene('yunxiao', '云效集成', 'Menu', '云效集成管理', 100);
+        $registry->registerCard('yunxiao-connections', 'yunxiao', '云效连接', '维护云效连接、项目与工作项投影', null, null, '/yunxiao', null, [
+            'action_label' => '去查看',
+            'permission' => 'yunxiao.view',
+        ]);
     }
 }
