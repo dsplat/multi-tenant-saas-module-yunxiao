@@ -15,7 +15,9 @@ use MultiTenantSaas\Modules\Contracts\ModuleServiceProvider;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\RetryWritebacksCommand;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\SyncWorkitemsCommand;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\VerifyTemplateCommand;
+use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoAccountClientContract;
 use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoClientContract;
+use MultiTenantSaas\Modules\Yunxiao\Services\PlatformYunxiaoClient;
 use MultiTenantSaas\Modules\Yunxiao\Services\ProjexYunxiaoClient;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoProgressSummaryHandler;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWorkitemQueryHandler;
@@ -23,7 +25,7 @@ use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWritebackCommentDraftH
 use MultiTenantSaas\Modules\Yunxiao\Support\YunxiaoUrlGuard;
 
 /**
- * 云效集成（Region / Central OpenAPI 连接器）
+ * 云效集成（Region / Central / Account OpenAPI 连接器）
  *
  * 路由 / 迁移 / 视图 / 翻译由基类 ModuleServiceProvider 自动加载；
  * 这里只做绑定、能力点、资源保护声明、AI 工具、场景与命令注册。
@@ -45,6 +47,8 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         'template_map.manage' => ['manage', '模板/状态映射'],
         // issue #44：成员写操作（添加/移除/对账）
         'member.sync' => ['manage', '成员同步'],
+        // issue #46：账号级组织发现/成员/部门/角色（只读）
+        'organization.view' => ['view', '查看账号级组织/成员/部门/角色'],
     ];
 
     /** 旧脚手架能力点兼容别名：list/read → view，create/update/delete → manage */
@@ -59,6 +63,7 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
     protected function registerModuleBindings(): void
     {
         $this->app->bind(YunxiaoClientContract::class, ProjexYunxiaoClient::class);
+        $this->app->bind(YunxiaoAccountClientContract::class, PlatformYunxiaoClient::class);
         $this->app->singleton(YunxiaoUrlGuard::class);
     }
 
@@ -111,6 +116,7 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         $requirements->register('common.yunxiao.writeback.retry', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
         $requirements->register('common.yunxiao.template_map.manage', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
         $requirements->register('common.yunxiao.member.sync', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
+        $requirements->register('common.yunxiao.organization.view', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.view']);
         $requirements->register('common.yunxiao.list', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.view']);
         $requirements->register('common.yunxiao.read', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.view']);
         $requirements->register('common.yunxiao.create', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);

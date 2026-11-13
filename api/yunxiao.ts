@@ -21,6 +21,8 @@ export interface YunxiaoConnection {
   scope: string
   org_id: string | null
   org_name: string | null
+  default_org_id: string | null
+  org_allowlist: string[]
   region: string | null
   writeback_enabled: boolean
   default_template_id: string | null
@@ -37,9 +39,14 @@ export interface YunxiaoConnectionPayload {
   base_url?: string
   token?: string
   auth_type?: string
-  /** Region=组织专属域名；Central=中心组织（需 org_id + openapi-rdc 接入点） */
-  scope?: 'Region' | 'Central'
+  /**
+   * Region=组织专属域名；Central=中心组织（需 org_id + openapi-rdc 接入点）；
+   * Account=账号级令牌（组织发现/成员/部门/角色，可选 default_org_id + org_allowlist）。
+   */
+  scope?: 'Region' | 'Central' | 'Account'
   org_id?: string | null
+  default_org_id?: string | null
+  org_allowlist?: string[]
   region?: string | null
   writeback_enabled?: boolean
   token_expires_at?: string | null
@@ -51,7 +58,82 @@ export interface YunxiaoConnectionTestResult {
   ok: boolean
   projects: number
   templates: number
+  /** scope=Account 时返回组织数（其它 scope 为 0） */
+  organizations?: number
   error: string | null
+}
+
+// ========== 账号级组织（issue #46） ==========
+
+export interface YunxiaoOrganization {
+  organization_id: string
+  name: string
+}
+
+export interface YunxiaoAccountUser {
+  user_id: string
+  name: string
+  email: string | null
+  last_organization_id: string | null
+}
+
+export interface YunxiaoOrganizationMember {
+  user_id: string
+  name: string
+  email: string | null
+  status: string | null
+  role_id: string | null
+  role_ids: string[]
+  department_id: string | null
+  department_ids: string[]
+  joined_at: string | null
+}
+
+export interface YunxiaoDepartment {
+  department_id: string
+  name: string
+  parent_id: string | null
+  creator_id: string | null
+  has_children: boolean
+}
+
+export interface YunxiaoOrganizationRole {
+  role_id: string
+  name: string
+  organization_id: string | null
+  permissions: string[]
+}
+
+export interface YunxiaoOrganizationListResult {
+  connection_id: number
+  organizations: YunxiaoOrganization[]
+  total: number
+}
+
+export interface YunxiaoAccountUserResult {
+  connection_id: number
+  user: YunxiaoAccountUser
+}
+
+export interface YunxiaoOrganizationMembersResult {
+  connection_id: number
+  organization_id: string
+  members: YunxiaoOrganizationMember[]
+  total: number
+}
+
+export interface YunxiaoDepartmentsResult {
+  connection_id: number
+  organization_id: string
+  departments: YunxiaoDepartment[]
+  total: number
+}
+
+export interface YunxiaoOrganizationRolesResult {
+  connection_id: number
+  organization_id: string
+  roles: YunxiaoOrganizationRole[]
+  total: number
 }
 
 export interface YunxiaoProject {
@@ -213,6 +295,65 @@ export async function rotateYunxiaoToken(
     token,
     token_expires_at: tokenExpiresAt,
   })
+  return res.data
+}
+
+// ========== 账号级组织（issue #46） ==========
+
+export async function getYunxiaoOrganizations(
+  connectionId?: number,
+): Promise<YunxiaoOrganizationListResult> {
+  const res = await http.get<YunxiaoOrganizationListResult>(`${BASE}/organizations`, {
+    params: connectionId ? { connection_id: connectionId } : undefined,
+  })
+  return res.data
+}
+
+export async function getYunxiaoCurrentUser(
+  connectionId?: number,
+): Promise<YunxiaoAccountUserResult> {
+  const res = await http.get<YunxiaoAccountUserResult>(`${BASE}/user`, {
+    params: connectionId ? { connection_id: connectionId } : undefined,
+  })
+  return res.data
+}
+
+export async function getYunxiaoOrganizationMembers(
+  orgId: string,
+  params: {
+    connection_id?: number
+    page?: number
+    per_page?: number
+    max_results?: number
+    next_token?: string
+  } = {},
+): Promise<YunxiaoOrganizationMembersResult> {
+  const res = await http.get<YunxiaoOrganizationMembersResult>(
+    `${BASE}/organizations/${encodeURIComponent(orgId)}/members`,
+    { params },
+  )
+  return res.data
+}
+
+export async function getYunxiaoDepartments(
+  orgId: string,
+  params: { connection_id?: number; parent_id?: string } = {},
+): Promise<YunxiaoDepartmentsResult> {
+  const res = await http.get<YunxiaoDepartmentsResult>(
+    `${BASE}/organizations/${encodeURIComponent(orgId)}/departments`,
+    { params },
+  )
+  return res.data
+}
+
+export async function getYunxiaoOrganizationRoles(
+  orgId: string,
+  connectionId?: number,
+): Promise<YunxiaoOrganizationRolesResult> {
+  const res = await http.get<YunxiaoOrganizationRolesResult>(
+    `${BASE}/organizations/${encodeURIComponent(orgId)}/roles`,
+    { params: connectionId ? { connection_id: connectionId } : undefined },
+  )
   return res.data
 }
 

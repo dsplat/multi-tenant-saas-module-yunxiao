@@ -31,6 +31,10 @@ final class YunxiaoConfigurationException extends YunxiaoException
 
     public const REASON_ORG_MISSING = 'org_missing';
 
+    public const REASON_ORG_NOT_ALLOWED = 'org_not_allowed';
+
+    public const REASON_SCOPE_MISMATCH = 'scope_mismatch';
+
     public const REASON_TOKEN_EXPIRED = 'token_expired';
 
     public const REASON_WRITEBACK_DISABLED = 'writeback_disabled';

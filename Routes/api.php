@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Route;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ConnectionController;
+use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\OrganizationController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectMemberController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\SyncController;
@@ -22,6 +23,18 @@ use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\WritebackController;
 */
 
 Route::prefix('yunxiao')->middleware('operator.identify')->group(function (): void {
+    // 账号级组织能力（issue #46）：只读；需 scope=Account 连接 + organization.view
+    Route::get('organizations', [OrganizationController::class, 'index'])
+        ->middleware('capability:common.yunxiao.organization.view');
+    Route::get('user', [OrganizationController::class, 'user'])
+        ->middleware('capability:common.yunxiao.organization.view');
+    Route::get('organizations/{orgId}/members', [OrganizationController::class, 'members'])
+        ->middleware('capability:common.yunxiao.organization.view');
+    Route::get('organizations/{orgId}/departments', [OrganizationController::class, 'departments'])
+        ->middleware('capability:common.yunxiao.organization.view');
+    Route::get('organizations/{orgId}/roles', [OrganizationController::class, 'roles'])
+        ->middleware('capability:common.yunxiao.organization.view');
+
     // 连接（脱敏；token 只进不出）
     Route::get('connections', [ConnectionController::class, 'index'])
         ->middleware('capability:common.yunxiao.connection.view');

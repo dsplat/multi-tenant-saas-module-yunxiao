@@ -1,6 +1,6 @@
 # Yunxiao 集成（阿里云效连接器）
 
-云效项目、工作项与模板映射投影，以及把 GitLab 事件对账写回云效。连接、游标/outbox、inbox 全部复用 Integration，模块不建第二套连接或同步表。
+云效项目、工作项与模板映射投影，把 GitLab 事件对账写回云效，并提供账号级组织发现/成员/部门/角色只读能力。连接、游标/outbox、inbox 全部复用 Integration，模块不建第二套连接或同步表。
 
 ## 分层与依赖
 
@@ -14,7 +14,7 @@
 | 键 | 说明 |
 |---|---|
 | `enabled` / `per_page` | 模块开关、分页；路由固定为 `api/v1/yunxiao` |
-| `api.base_url` / `api.central_base_url` / `auth_style` / `timeout` / `rate_limit` / `page_size` / `max_pages` | 云效 API 与限流参数；Region / Central 默认接入点分列 |
+| `api.base_url` / `api.central_base_url` / `auth_style` / `timeout` / `rate_limit` / `page_size` / `max_pages` | 云效 API 与限流参数；Region 与中心站（Central / Account）默认接入点分列 |
 | `security.allow_http` / `allow_private_hosts` / `allowed_host_suffixes` / `blocked_hosts` | SSRF 防护；默认只允许 HTTPS 与云效域名后缀 |
 | `members.role_id` / `manager_role_id` / `auto_repair` / `prune` | 成员对账：默认成员/负责人角色、缺失自动补齐、prune 默认开关（见「成员对账」） |
 | `sync.resource` / `rate_limit_backoff_ms` / `max_rate_limit_retries` / `detail_timeout` / `stale_minutes` | 游标资源名、限流退避、单条详情超时、投影过期阈值 |
@@ -23,6 +23,7 @@
 ## 路由（`api/v1/yunxiao`）
 
 - `connections`：列表、创建、更新、测试、轮换
+- `organizations` / `organizations/{orgId}/members|departments|roles` / `user`：账号级组织只读（issue #46）
 - `projects`：列表、创建（H1）
 - `projects/{id}/members`：成员列表（GET）、添加（POST）、移除（DELETE `/{userId}`）、
   按期望集合对账（POST `/sync`，issue #44）
@@ -41,6 +42,7 @@
 - `common.yunxiao.template_map.manage`
 - `common.yunxiao.writeback.view` / `writeback.retry`
 - `common.yunxiao.member.sync`（成员添加/移除/对账）
+- `common.yunxiao.organization.view`（账号级组织/成员/部门/角色只读）
 - 兼容别名：`list` / `read` → 查看；`create` / `update` / `delete` → 管理
 
 ## projex OpenAPI 契约（Region / Central）
@@ -51,6 +53,7 @@
 |---|---|---|
 | `Region` | `https://{org}.devops.aliyuncs.com` | `/oapi/v1/projex`（不拼 organizationId） |
 | `Central` | `https://openapi-rdc.aliyuncs.com` | `/oapi/v1/projex/organizations/{organizationId}`（必拼，来自 `config.org_id`） |
+| `Account` | `https://openapi-rdc.aliyuncs.com` | 项目级调用拼 `organizations/{default_org_id}`；组织级走 `/oapi/v1/platform`（见下节） |
 
 连接创建/更新时 `config.scope=Central` **必须**带 `config.org_id`（中心组织管理后台「基本信息」的组织 ID），
 缺失即 422/配置错误，不会发请求。Central 使用该组织创建的个人访问令牌；Region 令牌与中心令牌不通用
@@ -74,6 +77,32 @@
 | 移除项目成员 | `DELETE /projects/{id}/members` | DELETE 仍要 body `userId`（+ 可选 `roleIds[]`）；成功**空响应体** |
 
 增量同步把游标（毫秒时间戳或 ISO）转成 `conditions`：`gmtModified` `BETWEEN [cursor, now]`，按 `gmtModified desc` 翻页。
+
+## 账号级组织能力（issue #46）
+
+连接 `config.scope=Account`（阿里云主账号账号级个人访问令牌）时，模块通过 `/oapi/v1/platform` 提供只读组织能力：
+
+| 能力 | 方法 / 路径 | 端点 |
+|---|---|---|
+| 组织列表 | `GET /oapi/v1/platform/organizations` | `GET api/v1/yunxiao/organizations` |
+| 当前用户 | `GET /oapi/v1/platform/user` | `GET api/v1/yunxiao/user` |
+| 组织成员 | `GET /oapi/v1/platform/organizations/{orgId}/members` | `GET .../organizations/{orgId}/members` |
+| 组织部门 | `GET /oapi/v1/platform/organizations/{orgId}/departments` | `GET .../organizations/{orgId}/departments` |
+| 组织角色 | `GET /oapi/v1/platform/organizations/{orgId}/roles` | `GET .../organizations/{orgId}/roles` |
+
+连接配置（只对 `scope=Account` 生效）：
+
+- `config.default_org_id`：项目级 projex 调用（建项/工作项/项目成员）使用的组织；不配则项目级调用直接拒绝（`org_missing`），组织级接口不受影响。
+- `config.org_allowlist`：组织白名单。非空时列表只返回白名单内组织，单组织接口对白名单外组织返回 422（`org_not_allowed`）；`default_org_id` 必须在白名单内。
+
+归一化键：组织 `organization_id / name`；当前用户 `user_id / name / email / last_organization_id`；
+成员 `user_id / name / email / status / role_id / role_ids / department_id / department_ids / joined_at`；
+部门 `department_id / name / parent_id / creator_id / has_children`；角色 `role_id / name / organization_id / permissions`。
+成员分页支持 `page/per_page` 或 `max_results/next_token`；部门支持 `parent_id`。
+
+**operator 映射边界**：`operator_id ↔ 云效 user_id` 的映射表（`yunxiao_member_maps`）由宿主维护，本模块不做账号体系转换；
+下游用成员列表的 `email` / `name` 做「邮箱优先 + 姓名候选 + 管理员确认」，把映射后的云效 `userId` 传给
+`createProject.memberIds` 或项目成员接口。邮箱可能缺失（实测 3/6 无邮箱），不能只靠邮箱自动匹配。
 
 ## 成员对账（issue #44）
 

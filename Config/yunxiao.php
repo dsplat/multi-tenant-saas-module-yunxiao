@@ -19,7 +19,7 @@ return [
     'api' => [
         // Region OpenAPI 根地址；Region 连接未填 base_url 时使用。
         'base_url' => 'https://devops.aliyuncs.com',
-        // Central（中心组织）OpenAPI 根地址；scope=Central 且未填 base_url 时使用。
+        // 中心站 OpenAPI 根地址；scope=Central / Account 且未填 base_url 时使用。
         'central_base_url' => 'https://openapi-rdc.aliyuncs.com',
         // token 传递方式：token => `x-yunxiao-token`，bearer => `Authorization: Bearer`
         'auth_style' => 'token',

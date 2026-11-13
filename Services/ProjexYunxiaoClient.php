@@ -36,6 +36,12 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
     public const SCOPE_REGION = 'Region';
 
     /**
+     * 账号级（阿里云主账号）令牌：平台类接口 `/oapi/v1/platform/...`，
+     * 项目级 projex 调用用 `config.default_org_id` 补组织上下文。
+     */
+    public const SCOPE_ACCOUNT = 'Account';
+
+    /**
      * 工作项搜索的默认大类（公开 projex 契约：需求 / 任务 / 缺陷）。
      */
     private const WORKITEM_CATEGORIES = 'Req,Task,Bug';
@@ -53,16 +59,58 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
         return strcasecmp((string) (($connection->config ?? [])['scope'] ?? self::SCOPE_REGION), self::SCOPE_CENTRAL) === 0;
     }
 
+    public static function isAccount(IntegrationConnection $connection): bool
+    {
+        return strcasecmp((string) (($connection->config ?? [])['scope'] ?? self::SCOPE_REGION), self::SCOPE_ACCOUNT) === 0;
+    }
+
     /**
-     * projex 路径前缀：Central 必须拼 `organizations/{organizationId}`。
+     * projex 路径前缀：Central 必拼 `organizations/{org_id}`；
+     * Account 有 `default_org_id` 时同样拼（账号级令牌走同一组织上下文），否则拒绝项目级调用。
      */
     private function pathPrefix(IntegrationConnection $connection): string
     {
-        if (! self::isCentral($connection)) {
+        $organizationId = $this->projexOrganizationId($connection);
+
+        if ($organizationId === null) {
             return self::PATH_PREFIX;
         }
 
-        return self::PATH_PREFIX . '/organizations/' . rawurlencode($this->organizationId($connection));
+        return self::PATH_PREFIX . '/organizations/' . rawurlencode($organizationId);
+    }
+
+    private function projexOrganizationId(IntegrationConnection $connection): ?string
+    {
+        if (self::isCentral($connection)) {
+            return $this->organizationId($connection);
+        }
+
+        if (self::isAccount($connection)) {
+            $defaultOrgId = trim((string) (($connection->config ?? [])['default_org_id'] ?? ''));
+
+            if ($defaultOrgId === '') {
+                throw new YunxiaoConfigurationException(
+                    'Account 级连接未配置 default_org_id，不能调用项目级 projex 接口',
+                    YunxiaoConfigurationException::REASON_ORG_MISSING,
+                );
+            }
+
+            $allowlist = array_values(array_filter(
+                array_map(static fn ($id): string => trim((string) $id), (array) (($connection->config ?? [])['org_allowlist'] ?? [])),
+                static fn (string $id): bool => $id !== '',
+            ));
+
+            if ($allowlist !== [] && ! in_array($defaultOrgId, $allowlist, true)) {
+                throw new YunxiaoConfigurationException(
+                    'default_org_id 不在连接的允许列表内（config.org_allowlist）',
+                    YunxiaoConfigurationException::REASON_ORG_NOT_ALLOWED,
+                );
+            }
+
+            return $defaultOrgId;
+        }
+
+        return null;
     }
 
     /**
@@ -87,11 +135,12 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
      */
     public function defaultBaseUrl(IntegrationConnection $connection): string
     {
-        $key = self::isCentral($connection) ? 'yunxiao.api.central_base_url' : 'yunxiao.api.base_url';
+        $central = self::isCentral($connection) || self::isAccount($connection);
+        $key = $central ? 'yunxiao.api.central_base_url' : 'yunxiao.api.base_url';
 
         return (string) config(
             $key,
-            self::isCentral($connection) ? 'https://openapi-rdc.aliyuncs.com' : 'https://devops.aliyuncs.com',
+            $central ? 'https://openapi-rdc.aliyuncs.com' : 'https://devops.aliyuncs.com',
         );
     }
 
@@ -297,7 +346,7 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
      * @param  array<string, mixed>|null  $body
      * @return array<string, mixed>
      */
-    private function request(
+    protected function request(
         IntegrationConnection $connection,
         string $method,
         string $path,
@@ -493,13 +542,16 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
      * @param  array<string, mixed>  $data
      * @return list<array<string, mixed>>
      */
-    private function itemsOf(array $data): array
+    protected function itemsOf(array $data): array
     {
         if (array_is_list($data)) {
             return array_values(array_filter($data, 'is_array'));
         }
 
-        foreach (['items', 'list', 'records', 'templates', 'projects', 'workitems', 'members'] as $key) {
+        foreach ([
+            'items', 'list', 'records', 'templates', 'projects', 'workitems', 'members',
+            'organizations', 'roles', 'departments', 'users',
+        ] as $key) {
             if (isset($data[$key]) && is_array($data[$key])) {
                 return array_values(array_filter($data[$key], 'is_array'));
             }
@@ -615,7 +667,7 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
      * @param  array<string, mixed>  $item
      * @param  list<string>  $keys
      */
-    private function pick(array $item, array $keys): mixed
+    protected function pick(array $item, array $keys): mixed
     {
         foreach ($keys as $key) {
             if (array_key_exists($key, $item) && $item[$key] !== null && $item[$key] !== '') {

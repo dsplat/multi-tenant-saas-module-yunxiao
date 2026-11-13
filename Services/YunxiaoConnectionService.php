@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Event;
 use MultiTenantSaas\Context\TenantContext;
 use MultiTenantSaas\Modules\Integration\Models\IntegrationConnection;
 use MultiTenantSaas\Modules\Integration\Services\IntegrationConnectionService;
+use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoAccountClientContract;
 use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoClientContract;
 use MultiTenantSaas\Modules\Yunxiao\Events\YunxiaoConnectionChecked;
 use MultiTenantSaas\Modules\Yunxiao\Exceptions\YunxiaoConfigurationException;
@@ -31,6 +32,7 @@ class YunxiaoConnectionService
     public function __construct(
         private readonly IntegrationConnectionService $connections,
         private readonly YunxiaoClientContract $client,
+        private readonly YunxiaoAccountClientContract $accountClient,
         private readonly YunxiaoUrlGuard $urlGuard,
     ) {}
 
@@ -98,12 +100,74 @@ class YunxiaoConnectionService
         }
 
         foreach ($this->connections->forProvider($tenantId, self::PROVIDER) as $connection) {
-            if ($connection->status === IntegrationConnection::STATUS_ACTIVE) {
+            if ($connection->status !== IntegrationConnection::STATUS_ACTIVE) {
+                continue;
+            }
+
+            // 无 default_org_id 的 Account 连接只能做组织发现，不能顶替项目级连接。
+            if ($this->isProjexUnavailableAccount($connection)) {
+                continue;
+            }
+
+            return $connection;
+        }
+
+        throw new YunxiaoConfigurationException('租户尚未配置云效连接', YunxiaoConfigurationException::REASON_CONNECTION_NOT_FOUND);
+    }
+
+    private function isProjexUnavailableAccount(IntegrationConnection $connection): bool
+    {
+        return ProjexYunxiaoClient::isAccount($connection)
+            && trim((string) (($connection->config ?? [])['default_org_id'] ?? '')) === '';
+    }
+
+    /**
+     * 账号级连接（scope=Account）：显式 connection_id 优先，否则取首个 active Account 连接。
+     */
+    public function activeAccountConnection(int $tenantId, ?int $connectionId = null): IntegrationConnection
+    {
+        return $this->activeConnectionForScope($tenantId, ProjexYunxiaoClient::SCOPE_ACCOUNT, $connectionId);
+    }
+
+    /**
+     * 按 scope 取 active 连接；显式指定时必须与 scope 匹配，绝不把其它站点连接顶上来。
+     */
+    public function activeConnectionForScope(int $tenantId, string $scope, ?int $connectionId = null): IntegrationConnection
+    {
+        if ($connectionId !== null) {
+            $connection = $this->find($tenantId, $connectionId);
+
+            if ($connection->status !== IntegrationConnection::STATUS_ACTIVE) {
+                throw new YunxiaoConfigurationException('云效连接已停用', YunxiaoConfigurationException::REASON_CONNECTION_DISABLED);
+            }
+
+            if (! $this->connectionHasScope($connection, $scope)) {
+                throw new YunxiaoConfigurationException(
+                    sprintf('云效连接 scope 不是 %s', $scope),
+                    YunxiaoConfigurationException::REASON_SCOPE_MISMATCH,
+                );
+            }
+
+            return $connection;
+        }
+
+        foreach ($this->connections->forProvider($tenantId, self::PROVIDER) as $connection) {
+            if ($connection->status === IntegrationConnection::STATUS_ACTIVE && $this->connectionHasScope($connection, $scope)) {
                 return $connection;
             }
         }
 
-        throw new YunxiaoConfigurationException('租户尚未配置云效连接', YunxiaoConfigurationException::REASON_CONNECTION_NOT_FOUND);
+        throw new YunxiaoConfigurationException(
+            sprintf('租户尚未配置 %s 级云效连接', $scope),
+            YunxiaoConfigurationException::REASON_CONNECTION_NOT_FOUND,
+        );
+    }
+
+    private function connectionHasScope(IntegrationConnection $connection, string $scope): bool
+    {
+        $actual = (string) (($connection->config ?? [])['scope'] ?? ProjexYunxiaoClient::SCOPE_REGION);
+
+        return strcasecmp($actual, $scope) === 0;
     }
 
     /**
@@ -251,9 +315,12 @@ class YunxiaoConnectionService
     }
 
     /**
-     * 连通性/权限测试（列项目 + 模板），结果落 last_checked_*。
+     * 连通性/权限测试，结果落 last_checked_*。
      *
-     * @return array{ok:bool, projects:int, templates:int, error:string|null}
+     * - Region / Central：列项目 + 模板；
+     * - Account：列组织 + 当前用户（账号级令牌的只读探测）。
+     *
+     * @return array{ok:bool, projects:int, templates:int, organizations:int, error:string|null}
      */
     public function test(int $tenantId, int $connectionId): array
     {
@@ -261,20 +328,27 @@ class YunxiaoConnectionService
             $connection = $this->find($tenantId, $connectionId);
 
             try {
-                $projects = $this->client->listProjects($connection, ['page' => 1]);
-                $templates = $this->client->listTemplates($connection);
+                if (ProjexYunxiaoClient::isAccount($connection)) {
+                    $organizations = $this->accountClient->listOrganizations($connection);
+                    $this->accountClient->currentUser($connection);
+                    $counts = ['projects' => 0, 'templates' => 0, 'organizations' => count($organizations)];
+                } else {
+                    $projects = $this->client->listProjects($connection, ['page' => 1]);
+                    $templates = $this->client->listTemplates($connection);
+                    $counts = ['projects' => count($projects), 'templates' => count($templates), 'organizations' => 0];
+                }
             } catch (\Throwable $e) {
                 $error = $this->safeError($e);
                 $this->connections->markChecked($tenantId, $connectionId, $error);
                 Event::dispatch(new YunxiaoConnectionChecked($tenantId, $connectionId, false, $error));
 
-                return ['ok' => false, 'projects' => 0, 'templates' => 0, 'error' => $error];
+                return ['ok' => false, 'projects' => 0, 'templates' => 0, 'organizations' => 0, 'error' => $error];
             }
 
             $this->connections->markChecked($tenantId, $connectionId, null);
             Event::dispatch(new YunxiaoConnectionChecked($tenantId, $connectionId, true, null));
 
-            return ['ok' => true, 'projects' => count($projects), 'templates' => count($templates), 'error' => null];
+            return ['ok' => true, ...$counts, 'error' => null];
         });
     }
 
@@ -302,6 +376,8 @@ class YunxiaoConnectionService
             'scope' => $config['scope'] ?? 'Region',
             'org_id' => $config['org_id'] ?? null,
             'org_name' => $config['org_name'] ?? null,
+            'default_org_id' => $config['default_org_id'] ?? null,
+            'org_allowlist' => array_values((array) ($config['org_allowlist'] ?? [])),
             'region' => $config['region'] ?? null,
             'writeback_enabled' => (bool) ($config['writeback_enabled'] ?? false),
             'default_template_id' => $config['default_template_id'] ?? null,
@@ -380,6 +456,15 @@ class YunxiaoConnectionService
             }
         }
 
+        if (array_key_exists('default_org_id', $input)) {
+            $defaultOrgId = $input['default_org_id'] !== null ? trim((string) $input['default_org_id']) : '';
+            $config['default_org_id'] = $defaultOrgId === '' ? null : $defaultOrgId;
+        }
+
+        if (array_key_exists('org_allowlist', $input)) {
+            $config['org_allowlist'] = $this->normalizeOrgAllowlist($input['org_allowlist']);
+        }
+
         if (array_key_exists('auth_style', $input)) {
             $style = (string) $input['auth_style'];
 
@@ -421,15 +506,68 @@ class YunxiaoConnectionService
             );
         }
 
+        // 账号级：default_org_id 必须落在白名单内，否则项目级调用会被自己的边界拒绝。
+        if ($scope === ProjexYunxiaoClient::SCOPE_ACCOUNT) {
+            $defaultOrgId = trim((string) ($config['default_org_id'] ?? ''));
+            $allowlist = array_values((array) ($config['org_allowlist'] ?? []));
+
+            if ($defaultOrgId !== '' && $allowlist !== [] && ! in_array($defaultOrgId, $allowlist, true)) {
+                throw new YunxiaoConfigurationException(
+                    'default_org_id 必须在 org_allowlist 内',
+                    YunxiaoConfigurationException::REASON_ORG_NOT_ALLOWED,
+                );
+            }
+        }
+
         return $config;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function normalizeOrgAllowlist(mixed $value): array
+    {
+        if ($value === null) {
+            return [];
+        }
+
+        if (! is_array($value)) {
+            throw new YunxiaoConfigurationException('org_allowlist 必须是组织 ID 数组');
+        }
+
+        $ids = [];
+
+        foreach ($value as $id) {
+            if (! is_scalar($id)) {
+                throw new YunxiaoConfigurationException('org_allowlist 只能包含组织 ID 字符串');
+            }
+
+            $id = trim((string) $id);
+
+            if ($id === '') {
+                continue;
+            }
+
+            if (mb_strlen($id) > 100) {
+                throw new YunxiaoConfigurationException('org_allowlist 中的组织 ID 不能超过 100 字符');
+            }
+
+            $ids[] = $id;
+        }
+
+        return array_values(array_unique($ids));
     }
 
     private function normalizeScope(mixed $scope): string
     {
         $normalized = ucfirst(strtolower(trim((string) $scope)));
 
-        if (! in_array($normalized, [ProjexYunxiaoClient::SCOPE_REGION, ProjexYunxiaoClient::SCOPE_CENTRAL], true)) {
-            throw new YunxiaoConfigurationException('scope 仅支持 Region|Central');
+        if (! in_array($normalized, [
+            ProjexYunxiaoClient::SCOPE_REGION,
+            ProjexYunxiaoClient::SCOPE_CENTRAL,
+            ProjexYunxiaoClient::SCOPE_ACCOUNT,
+        ], true)) {
+            throw new YunxiaoConfigurationException('scope 仅支持 Region|Central|Account');
         }
 
         return $normalized;
@@ -462,7 +600,9 @@ class YunxiaoConnectionService
 
     private function defaultBaseUrlFor(string $scope): string
     {
-        return $scope === ProjexYunxiaoClient::SCOPE_CENTRAL
+        $central = in_array($scope, [ProjexYunxiaoClient::SCOPE_CENTRAL, ProjexYunxiaoClient::SCOPE_ACCOUNT], true);
+
+        return $central
             ? (string) config('yunxiao.api.central_base_url', 'https://openapi-rdc.aliyuncs.com')
             : (string) config('yunxiao.api.base_url', 'https://devops.aliyuncs.com');
     }
@@ -471,7 +611,11 @@ class YunxiaoConnectionService
     {
         $normalized = rtrim(strtolower(trim($url)), '/');
 
-        foreach ([ProjexYunxiaoClient::SCOPE_REGION, ProjexYunxiaoClient::SCOPE_CENTRAL] as $scope) {
+        foreach ([
+            ProjexYunxiaoClient::SCOPE_REGION,
+            ProjexYunxiaoClient::SCOPE_CENTRAL,
+            ProjexYunxiaoClient::SCOPE_ACCOUNT,
+        ] as $scope) {
             if ($normalized === rtrim(strtolower($this->defaultBaseUrlFor($scope)), '/')) {
                 return true;
             }
@@ -490,10 +634,20 @@ class YunxiaoConnectionService
     }
 
     /**
-     * 保存前探测：列项目 + 列模板（同时验证 token/组织/模板读取权限）。
+     * 保存前探测：按 scope 验证 token 与最小读取权限。
+     *
+     * Region / Central：列项目 + 模板（组织/模板读取）；
+     * Account：列组织 + 当前用户（账号级只读），不要求 default_org_id 已配置。
      */
     private function probe(IntegrationConnection $probe): void
     {
+        if (ProjexYunxiaoClient::isAccount($probe)) {
+            $this->accountClient->listOrganizations($probe);
+            $this->accountClient->currentUser($probe);
+
+            return;
+        }
+
         $this->client->listProjects($probe, ['page' => 1]);
         $this->client->listTemplates($probe);
     }
