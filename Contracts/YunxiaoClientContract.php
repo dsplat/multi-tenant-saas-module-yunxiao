@@ -7,7 +7,7 @@ namespace MultiTenantSaas\Modules\Yunxiao\Contracts;
 use MultiTenantSaas\Modules\Integration\Models\IntegrationConnection;
 
 /**
- * 云效 Region OpenAPI 客户端契约
+ * 云效 projex OpenAPI 客户端契约（Region + Central 双站点）
  *
  * 实现只负责 HTTP + 字段归一化；连接/凭据由 IntegrationConnection 提供。
  * 测试注入 fake 实现，禁止在测试中真实外呼。
@@ -19,8 +19,8 @@ use MultiTenantSaas\Modules\Integration\Models\IntegrationConnection;
  *  - template: template_id / name / workitem_types[{id,name}] / statuses[{id,name,workitem_type_id}]
  *  - member: id / name
  *
- * 成员写操作（依据云效 Region 版 API 参考 CreateProjectMember / DeleteProjectMember /
- * ListProjectMembers；实例侧未真实外呼实测，wire shape 由 RegionYunxiaoClientTest 锁定）：
+ * 成员写操作（依据云效中心版 / Region 版 API 参考 CreateProjectMember / DeleteProjectMember /
+ * ListProjectMembers；两版均未真实外呼实测，wire shape 由 ProjexYunxiaoClientTest 锁定）：
  *  - 添加：body `{roleId, userIds[]}`，roleId 必填（`project.participant` / `project.admin` 等）；
  *  - 移除：DELETE 仍要求 body `{userId, roleIds[]?}`（不是路径参数）；
  *  - 两个接口成功时**返回空响应体**，实现不得按 JSON 解析失败处理。

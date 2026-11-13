@@ -37,7 +37,8 @@ export interface YunxiaoConnectionPayload {
   base_url?: string
   token?: string
   auth_type?: string
-  scope?: 'Region'
+  /** Region=组织专属域名；Central=中心组织（需 org_id + openapi-rdc 接入点） */
+  scope?: 'Region' | 'Central'
   org_id?: string | null
   region?: string | null
   writeback_enabled?: boolean

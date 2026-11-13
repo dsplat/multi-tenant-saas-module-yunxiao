@@ -9,7 +9,8 @@ use MultiTenantSaas\Modules\Yunxiao\Exceptions\YunxiaoConfigurationException;
 /**
  * 云效 base_url SSRF 守卫
  *
- * 默认只允许 https + 云效 Region host（`*.devops.aliyuncs.com`）。
+ * 默认只允许 https + 云效 Region host（`*.devops.aliyuncs.com`）或
+ * Central 接入点（`openapi-rdc.aliyuncs.com`）。
  * 拒绝 localhost、私网/保留地址、云元数据地址与 URL 内嵌凭据。
  * 测试可通过 `yunxiao.security.allow_private_hosts=true` 放行私有 host，
  * 但仍要求 https（除非同时打开 allow_http）。
@@ -90,7 +91,7 @@ final class YunxiaoUrlGuard
                 }
 
                 if (! $allowed) {
-                    throw YunxiaoConfigurationException::unsafeBaseUrl('host 不属于允许的云效 Region 域名');
+                    throw YunxiaoConfigurationException::unsafeBaseUrl('host 不属于允许的云效域名');
                 }
             }
         }

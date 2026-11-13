@@ -120,8 +120,8 @@ class YunxiaoConnectionService
                 throw new YunxiaoConfigurationException('连接名称不能为空');
             }
 
-            $baseUrl = $this->urlGuard->assertSafe((string) ($data['base_url'] ?? config('yunxiao.api.base_url')));
             $config = $this->normalizeConfig((array) ($data['config'] ?? []), []);
+            $baseUrl = $this->resolveBaseUrl($data['base_url'] ?? null, $config);
             $token = (string) ($data['token'] ?? '');
 
             if ($token === '') {
@@ -147,7 +147,7 @@ class YunxiaoConnectionService
     }
 
     /**
-     * 更新连接；仅当 token/base_url/auth_style 变更时重新测试。
+     * 更新连接；token / base_url / auth_style / scope / org_id 变更时重新测试。
      *
      * @param  array<string, mixed>  $data
      */
@@ -155,15 +155,16 @@ class YunxiaoConnectionService
     {
         return TenantContext::runInTenant($tenantId, function () use ($tenantId, $connectionId, $data): IntegrationConnection {
             $connection = $this->find($tenantId, $connectionId);
-            $baseUrl = array_key_exists('base_url', $data) && $data['base_url'] !== null
-                ? $this->urlGuard->assertSafe((string) $data['base_url'])
-                : $connection->base_url;
             $config = $this->normalizeConfig((array) ($data['config'] ?? []), (array) ($connection->config ?? []));
+            $baseUrl = $this->resolveBaseUrl($data['base_url'] ?? null, $config, $connection);
             $token = isset($data['token']) && $data['token'] !== '' ? (string) $data['token'] : null;
             $authStyleChanged = isset($data['config']['auth_style'])
                 && (string) $data['config']['auth_style'] !== (string) ($connection->config['auth_style'] ?? 'token');
+            // scope / organizationId 变更会改变路径前缀，必须重新探测。
+            $scopeChanged = (string) ($config['scope'] ?? 'Region') !== (string) ($connection->config['scope'] ?? 'Region');
+            $orgIdChanged = (string) ($config['org_id'] ?? '') !== (string) ($connection->config['org_id'] ?? '');
 
-            if ($token !== null || $baseUrl !== $connection->base_url || $authStyleChanged) {
+            if ($token !== null || $baseUrl !== $connection->base_url || $authStyleChanged || $scopeChanged || $orgIdChanged) {
                 $probe = $this->probeModel(
                     $tenantId,
                     (string) ($data['name'] ?? $connection->name),
@@ -180,7 +181,8 @@ class YunxiaoConnectionService
                 $attributes['name'] = (string) $data['name'];
             }
 
-            if (array_key_exists('base_url', $data)) {
+            // scope 切换会按站点改默认接入点；即使请求没显式带 base_url 也要落库。
+            if (array_key_exists('base_url', $data) || $baseUrl !== (string) ($connection->base_url ?? '')) {
                 $attributes['base_url'] = $baseUrl;
             }
 
@@ -220,19 +222,27 @@ class YunxiaoConnectionService
                 $config['token_expires_at'] = $this->normalizeExpiry($expiresAt);
             }
 
+            $baseUrl = $this->resolveBaseUrl(null, $config, $connection);
+
             $probe = $this->probeModel(
                 $tenantId,
                 (string) $connection->name,
-                (string) ($connection->base_url ?: config('yunxiao.api.base_url')),
+                $baseUrl,
                 $token,
                 $config,
             );
             $this->probe($probe);
 
-            $updated = $this->connections->update($tenantId, $connectionId, [
+            $attributes = [
                 'credentials' => array_merge((array) ($connection->credentials ?? []), ['token' => $token]),
                 'config' => $config,
-            ]);
+            ];
+
+            if ($baseUrl !== (string) ($connection->base_url ?? '')) {
+                $attributes['base_url'] = $baseUrl;
+            }
+
+            $updated = $this->connections->update($tenantId, $connectionId, $attributes);
             $this->connections->markChecked($tenantId, $connectionId);
             Event::dispatch(new YunxiaoConnectionChecked($tenantId, $connectionId, true, null));
 
@@ -361,13 +371,8 @@ class YunxiaoConnectionService
     {
         $config = $existing;
 
-        $scope = $input['scope'] ?? $existing['scope'] ?? 'Region';
-
-        if (! in_array($scope, ['Region'], true)) {
-            throw new YunxiaoConfigurationException('P0 仅支持 Region 组织（Central 为 P1）');
-        }
-
-        $config['scope'] = 'Region';
+        $scope = $this->normalizeScope($input['scope'] ?? $existing['scope'] ?? ProjexYunxiaoClient::SCOPE_REGION);
+        $config['scope'] = $scope;
 
         foreach (['org_id', 'org_name', 'region', 'default_template_id'] as $key) {
             if (array_key_exists($key, $input)) {
@@ -408,7 +413,71 @@ class YunxiaoConnectionService
                 : null;
         }
 
+        // 中心版所有 projex 路径都带 organizationId；缺失时保存即失败，不落一个必坏的连接。
+        if ($scope === ProjexYunxiaoClient::SCOPE_CENTRAL && trim((string) ($config['org_id'] ?? '')) === '') {
+            throw new YunxiaoConfigurationException(
+                'Central 组织连接必须提供 organizationId（config.org_id）',
+                YunxiaoConfigurationException::REASON_ORG_MISSING,
+            );
+        }
+
         return $config;
+    }
+
+    private function normalizeScope(mixed $scope): string
+    {
+        $normalized = ucfirst(strtolower(trim((string) $scope)));
+
+        if (! in_array($normalized, [ProjexYunxiaoClient::SCOPE_REGION, ProjexYunxiaoClient::SCOPE_CENTRAL], true)) {
+            throw new YunxiaoConfigurationException('scope 仅支持 Region|Central');
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * 连接 base_url：显式值优先；否则按 scope 取默认接入点。
+     *
+     * 更新连接且未显式改地址时，当前地址是已知默认接入点（或为空）才跟随 scope 切换，
+     * 避免 Region ⇄ Central 后继续打旧域名；自定义代理域名保持不动。
+     *
+     * @param  array<string, mixed>  $config
+     */
+    private function resolveBaseUrl(mixed $provided, array $config, ?IntegrationConnection $existing = null): string
+    {
+        $provided = is_string($provided) ? trim($provided) : '';
+
+        if ($provided !== '') {
+            return $this->urlGuard->assertSafe($provided);
+        }
+
+        $current = $existing !== null ? trim((string) ($existing->base_url ?? '')) : '';
+
+        if ($current !== '' && ! $this->isDefaultBaseUrl($current)) {
+            return $this->urlGuard->assertSafe($current);
+        }
+
+        return $this->urlGuard->assertSafe($this->defaultBaseUrlFor((string) ($config['scope'] ?? ProjexYunxiaoClient::SCOPE_REGION)));
+    }
+
+    private function defaultBaseUrlFor(string $scope): string
+    {
+        return $scope === ProjexYunxiaoClient::SCOPE_CENTRAL
+            ? (string) config('yunxiao.api.central_base_url', 'https://openapi-rdc.aliyuncs.com')
+            : (string) config('yunxiao.api.base_url', 'https://devops.aliyuncs.com');
+    }
+
+    private function isDefaultBaseUrl(string $url): bool
+    {
+        $normalized = rtrim(strtolower(trim($url)), '/');
+
+        foreach ([ProjexYunxiaoClient::SCOPE_REGION, ProjexYunxiaoClient::SCOPE_CENTRAL] as $scope) {
+            if ($normalized === rtrim(strtolower($this->defaultBaseUrlFor($scope)), '/')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function normalizeExpiry(string $value): string

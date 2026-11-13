@@ -14,7 +14,7 @@
 | 键 | 说明 |
 |---|---|
 | `enabled` / `per_page` | 模块开关、分页；路由固定为 `api/v1/yunxiao` |
-| `api.base_url` / `auth_style` / `timeout` / `rate_limit` / `page_size` / `max_pages` | 云效 API 与限流参数 |
+| `api.base_url` / `api.central_base_url` / `auth_style` / `timeout` / `rate_limit` / `page_size` / `max_pages` | 云效 API 与限流参数；Region / Central 默认接入点分列 |
 | `security.allow_http` / `allow_private_hosts` / `allowed_host_suffixes` / `blocked_hosts` | SSRF 防护；默认只允许 HTTPS 与云效域名后缀 |
 | `members.role_id` / `manager_role_id` / `auto_repair` / `prune` | 成员对账：默认成员/负责人角色、缺失自动补齐、prune 默认开关（见「成员对账」） |
 | `sync.resource` / `rate_limit_backoff_ms` / `max_rate_limit_retries` / `detail_timeout` / `stale_minutes` | 游标资源名、限流退避、单条详情超时、投影过期阈值 |
@@ -43,12 +43,24 @@
 - `common.yunxiao.member.sync`（成员添加/移除/对账）
 - 兼容别名：`list` / `read` → 查看；`create` / `update` / `delete` → 管理
 
-## Region OpenAPI 契约（实例域）
+## projex OpenAPI 契约（Region / Central）
 
-实例域（`*.devops.aliyuncs.com`）不拼 `organizationId`，且 projex 的列表语义是 `:search` POST + 复数集合 GET。
+云效 projex 有两条接入点，wire shape 相同，只差路径前缀与默认域名：
+
+| scope | 默认 base_url | 路径前缀 |
+|---|---|---|
+| `Region` | `https://{org}.devops.aliyuncs.com` | `/oapi/v1/projex`（不拼 organizationId） |
+| `Central` | `https://openapi-rdc.aliyuncs.com` | `/oapi/v1/projex/organizations/{organizationId}`（必拼，来自 `config.org_id`） |
+
+连接创建/更新时 `config.scope=Central` **必须**带 `config.org_id`（中心组织管理后台「基本信息」的组织 ID），
+缺失即 422/配置错误，不会发请求。Central 使用该组织创建的个人访问令牌；Region 令牌与中心令牌不通用
+（issue #45 实测：Region 令牌打中心路径 401 InvalidToken）。`base_url` 省略时按 scope 取默认接入点；
+显式填写自定义域名时保持不动（SSRF 白名单仍只放行 `*.devops.aliyuncs.com` 与 `openapi-rdc.aliyuncs.com`）。
+
+表内路径均相对上述「路径前缀」；Region 实例域不拼 `organizationId`，且列表语义是 `:search` POST + 复数集合 GET。
 `GET /projects`、`GET /templates` 在实例域返回 404（issue #17，v3.10.6 及以前踩中）。
 
-| 能力 | 方法 / 路径（相对 `/oapi/v1/projex`） | 备注 |
+| 能力 | 方法 / 路径（相对路径前缀） | 备注 |
 |---|---|---|
 | 项目列表 | `POST /projects:search` | body `page` / `perPage`；返回数组 |
 | 项目详情 | `GET /projects/{id}` | |
@@ -81,8 +93,9 @@
 - **失败语义**：远端成员列表读不到时不补写（无法计算差集），全部按失败记录；单个移除失败
   记入 `failed_removals` 并保留 `managed_members` 重试资格；期望集合为空显式 422
   （`reason=member_list_empty`），不静默当成「无需成员」。
-- **未实测边界**：成员写接口按云效 Region 版 API 参考实现，尚未用真实实例外呼验证；
-  请求/响应形状由 `tests/Yunxiao/RegionYunxiaoClientTest.php` 锁定（含空响应体与 DELETE body）。
+- **未实测边界**：成员写接口按云效中心版 / Region 版 API 参考实现，尚未用真实实例外呼验证；
+  请求/响应形状由 `tests/Yunxiao/ProjexYunxiaoClientTest.php` 锁定（含空响应体与 DELETE body，
+  以及 Central 的 `organizations/{organizationId}` 前缀）。
   写操作**没有 outbox/幂等键**：远端已成功、本地落盘失败时重试可能重复提交；云效对
   「添加已存在成员」的返回行为未实测，调用方不要把 add 当作严格幂等。
 

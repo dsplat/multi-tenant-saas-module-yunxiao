@@ -16,14 +16,14 @@ use MultiTenantSaas\Modules\Yunxiao\Console\Commands\RetryWritebacksCommand;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\SyncWorkitemsCommand;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\VerifyTemplateCommand;
 use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoClientContract;
-use MultiTenantSaas\Modules\Yunxiao\Services\RegionYunxiaoClient;
+use MultiTenantSaas\Modules\Yunxiao\Services\ProjexYunxiaoClient;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoProgressSummaryHandler;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWorkitemQueryHandler;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWritebackCommentDraftHandler;
 use MultiTenantSaas\Modules\Yunxiao\Support\YunxiaoUrlGuard;
 
 /**
- * 云效集成（Region OpenAPI 连接器）
+ * 云效集成（Region / Central OpenAPI 连接器）
  *
  * 路由 / 迁移 / 视图 / 翻译由基类 ModuleServiceProvider 自动加载；
  * 这里只做绑定、能力点、资源保护声明、AI 工具、场景与命令注册。
@@ -58,7 +58,7 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
 
     protected function registerModuleBindings(): void
     {
-        $this->app->bind(YunxiaoClientContract::class, RegionYunxiaoClient::class);
+        $this->app->bind(YunxiaoClientContract::class, ProjexYunxiaoClient::class);
         $this->app->singleton(YunxiaoUrlGuard::class);
     }
 

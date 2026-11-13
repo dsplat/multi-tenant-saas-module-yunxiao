@@ -17,8 +17,10 @@ return [
     'per_page' => 20,
 
     'api' => [
-        // Region OpenAPI 根地址；连接未填 base_url 时使用。Central 组织由 P1 driver 处理。
+        // Region OpenAPI 根地址；Region 连接未填 base_url 时使用。
         'base_url' => 'https://devops.aliyuncs.com',
+        // Central（中心组织）OpenAPI 根地址；scope=Central 且未填 base_url 时使用。
+        'central_base_url' => 'https://openapi-rdc.aliyuncs.com',
         // token 传递方式：token => `x-yunxiao-token`，bearer => `Authorization: Bearer`
         'auth_style' => 'token',
         // 连接/请求超时（秒）
@@ -32,7 +34,8 @@ return [
     ],
 
     /*
-     * SSRF 边界：只允许 https + 云效 Region host。
+     * SSRF 边界：只允许 https + 云效 Region / Central 接入点 host。
+     * Region 是组织专属域 `*.devops.aliyuncs.com`；Central 固定 `openapi-rdc.aliyuncs.com`。
      * 测试可用 security.allow_private_hosts / allow_http 显式放开私有 host，
      * 生产环境不得打开（见需求 §6.11）。
      */
@@ -41,6 +44,7 @@ return [
         'allow_private_hosts' => false,
         'allowed_host_suffixes' => [
             'devops.aliyuncs.com',
+            'openapi-rdc.aliyuncs.com',
         ],
         'blocked_hosts' => [
             'localhost',
@@ -84,7 +88,7 @@ return [
     /*
      * 项目成员对账（issue #44）
      *
-     * 云效 Region 版 CreateProjectMember 的 roleId 必填；这里给默认角色，
+     * 云效 CreateProjectMember（中心版 / Region 版）的 roleId 必填；这里给默认角色，
      * 调用方可在 members 写接口里用 role_id 覆盖。
      */
     'members' => [
