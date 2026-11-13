@@ -80,4 +80,21 @@ return [
         'pattern' => '/^[A-Z]{4,6}$/',
         'generated_length' => 6,
     ],
+
+    /*
+     * 项目成员对账（issue #44）
+     *
+     * 云效 Region 版 CreateProjectMember 的 roleId 必填；这里给默认角色，
+     * 调用方可在 members 写接口里用 role_id 覆盖。
+     */
+    'members' => [
+        // 普通成员默认项目角色
+        'role_id' => 'project.participant',
+        // 项目负责人（project_manager）默认角色；负责人缺失时按此角色补加
+        'manager_role_id' => 'project.admin',
+        // 建项/重试/对账发现期望成员缺失时是否自动写云效补齐
+        'auto_repair' => true,
+        // syncMembers 默认是否 prune；默认 false，手工在云效加的成员永不被移除
+        'prune' => false,
+    ],
 ];

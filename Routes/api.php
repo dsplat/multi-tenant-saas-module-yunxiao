@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Route;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ConnectionController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectController;
+use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectMemberController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\SyncController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\TemplateMapController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\WorkitemController;
@@ -38,6 +39,16 @@ Route::prefix('yunxiao')->middleware('operator.identify')->group(function (): vo
         ->middleware('capability:common.yunxiao.project.view');
     Route::post('projects', [ProjectController::class, 'store'])
         ->middleware('capability:common.yunxiao.project.create');
+
+    // 项目成员（issue #44）：只读列表用 project.view，写操作用 member.sync。
+    Route::get('projects/{id}/members', [ProjectMemberController::class, 'index'])
+        ->middleware('capability:common.yunxiao.project.view');
+    Route::post('projects/{id}/members', [ProjectMemberController::class, 'store'])
+        ->middleware('capability:common.yunxiao.member.sync');
+    Route::post('projects/{id}/members/sync', [ProjectMemberController::class, 'sync'])
+        ->middleware('capability:common.yunxiao.member.sync');
+    Route::delete('projects/{id}/members/{userId}', [ProjectMemberController::class, 'destroy'])
+        ->middleware('capability:common.yunxiao.member.sync');
 
     // 工作项投影（只读）
     Route::get('workitems', [WorkitemController::class, 'index'])

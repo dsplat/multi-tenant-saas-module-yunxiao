@@ -40,8 +40,8 @@ class YunxiaoProjectService
     ) {}
 
     /**
-     * @param  array{project_id:int, name:string, project_type:string, custom_code?:string|null, scope?:string|null, description?:string|null, project_manager?:string|null, members?:list<string>, connection_id?:int|null}  $input
-     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>}
+     * @param  array{project_id:int, name:string, project_type:string, custom_code?:string|null, scope?:string|null, description?:string|null, project_manager?:string|null, members?:list<string>, role_id?:string|null, connection_id?:int|null}  $input
+     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>, added:list<string>}
      */
     public function create(int $tenantId, array $input): array
     {
@@ -133,7 +133,10 @@ class YunxiaoProjectService
                 'status' => YunxiaoProject::STATUS_ACTIVE,
                 'metadata' => array_filter([
                     'project_type' => $input['project_type'],
+                    'project_manager' => trim((string) ($input['project_manager'] ?? '')) ?: null,
                     'expected_assignments' => $expected !== [] ? $expected : null,
+                    // 建项时随 createProject 一起提交的成员属于「平台添加」，prune 时才是可回收集合。
+                    'managed_members' => $expected !== [] ? $expected : null,
                     'mapping_pending' => false,
                 ], static fn ($value): bool => $value !== null),
             ]);
@@ -179,7 +182,11 @@ class YunxiaoProjectService
                 ];
             }
 
-            return $this->verifyAssignments($tenantId, $project, $connection, $expected);
+            return $this->verifyAssignments($tenantId, $project, $connection, $expected, [
+                'repair' => (bool) config('yunxiao.members.auto_repair', true),
+                'manager' => $input['project_manager'] ?? null,
+                'role_id' => $input['role_id'] ?? null,
+            ], true);
         });
     }
 
@@ -224,7 +231,7 @@ class YunxiaoProjectService
     }
 
     /**
-     * 重试成员/PM 指派核验（不新增成员，无成员写 API 时降级为部分成功）。
+     * 重试成员/PM 指派核验：按 metadata 里的期望集合补齐缺失成员（issue #44）。
      *
      * @return list<string> 仍缺失的成员 ID
      */
@@ -234,7 +241,10 @@ class YunxiaoProjectService
             $project = $this->find($tenantId, $yunxiaoProjectId);
             $connection = $this->connections->find($tenantId, (int) $project->connection_id);
             $expected = array_values(array_map('strval', (array) ($project->metadata['expected_assignments'] ?? [])));
-            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected);
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected, [
+                'repair' => true,
+                'manager' => $project->metadata['project_manager'] ?? null,
+            ]);
 
             return $result['assignment_failures'];
         });
@@ -242,7 +252,7 @@ class YunxiaoProjectService
 
     /**
      * @param  array<string, mixed>  $input
-     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>}
+     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>, added:list<string>}
      */
     private function resume(int $tenantId, YunxiaoProject $project, array $input): array
     {
@@ -280,20 +290,49 @@ class YunxiaoProjectService
                     'created' => false,
                     'mapping_status' => 'pending',
                     'assignment_failures' => $project->assignmentFailures(),
+                    'added' => [],
                 ];
             }
         }
 
-        if ($project->status === YunxiaoProject::STATUS_PARTIAL) {
+        // 已存在项目再次携带成员清单 = 成员/PM 变更请求（issue #44）：按新期望补齐，不重建项目。
+        $hasMemberIntent = array_key_exists('members', $input) || array_key_exists('project_manager', $input);
+        $storedExpected = $this->normalizeMemberIds((array) ($project->metadata['expected_assignments'] ?? []));
+        $requestedExpected = $hasMemberIntent ? $this->requestedAssignments($project, $input) : [];
+
+        if ($hasMemberIntent && $requestedExpected !== $storedExpected) {
             $connection = $this->connections->find($tenantId, (int) $project->connection_id);
-            $expected = array_values(array_map('strval', (array) ($project->metadata['expected_assignments'] ?? [])));
-            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected);
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $requestedExpected, [
+                'repair' => (bool) config('yunxiao.members.auto_repair', true),
+                'manager' => array_key_exists('project_manager', $input)
+                    ? ($input['project_manager'] ?? null)
+                    : ($project->metadata['project_manager'] ?? null),
+                'role_id' => $input['role_id'] ?? null,
+            ]);
 
             return [
                 'project' => $result['project'],
                 'created' => false,
                 'mapping_status' => $result['mapping_status'],
                 'assignment_failures' => $result['assignment_failures'],
+                'added' => $result['added'],
+            ];
+        }
+
+        if ($project->status === YunxiaoProject::STATUS_PARTIAL) {
+            $connection = $this->connections->find($tenantId, (int) $project->connection_id);
+            $expected = array_values(array_map('strval', (array) ($project->metadata['expected_assignments'] ?? [])));
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected, [
+                'repair' => true,
+                'manager' => $project->metadata['project_manager'] ?? null,
+            ]);
+
+            return [
+                'project' => $result['project'],
+                'created' => false,
+                'mapping_status' => $result['mapping_status'],
+                'assignment_failures' => $result['assignment_failures'],
+                'added' => $result['added'],
             ];
         }
 
@@ -302,45 +341,268 @@ class YunxiaoProjectService
             'created' => false,
             'mapping_status' => 'ok',
             'assignment_failures' => [],
+            'added' => [],
         ];
     }
 
     /**
+     * 远端成员列表（只读）。
+     *
+     * @return array{project: YunxiaoProject, members: list<array<string, mixed>>}
+     */
+    public function members(int $tenantId, int $yunxiaoProjectId): array
+    {
+        return TenantContext::runInTenant($tenantId, function () use ($tenantId, $yunxiaoProjectId): array {
+            $project = $this->find($tenantId, $yunxiaoProjectId);
+            $connection = $this->connections->find($tenantId, (int) $project->connection_id);
+
+            return [
+                'project' => $project,
+                'members' => $this->client->listMembers($connection, (string) $project->external_project_id),
+            ];
+        });
+    }
+
+    /**
+     * 显式添加成员（写云效并合并进期望集合）。
+     *
+     * @param  list<string>  $userIds
+     * @return array{project: YunxiaoProject, added: list<string>, removed: list<string>, failures: list<string>}
+     */
+    public function addMembers(int $tenantId, int $yunxiaoProjectId, array $userIds, ?string $roleId = null): array
+    {
+        return TenantContext::runInTenant($tenantId, function () use ($tenantId, $yunxiaoProjectId, $userIds, $roleId): array {
+            $userIds = $this->normalizeMemberIds($userIds);
+
+            if ($userIds === []) {
+                throw new YunxiaoConfigurationException('成员列表不能为空', YunxiaoConfigurationException::REASON_MEMBER_LIST_EMPTY);
+            }
+
+            $project = $this->find($tenantId, $yunxiaoProjectId);
+            $connection = $this->connections->find($tenantId, (int) $project->connection_id);
+
+            $this->client->addMembers($connection, (string) $project->external_project_id, $userIds, [
+                'role_id' => $this->memberRoleId($roleId),
+            ]);
+
+            $metadata = (array) $project->metadata;
+            $metadata['expected_assignments'] = $this->mergeMemberIds((array) ($metadata['expected_assignments'] ?? []), $userIds);
+            $metadata['managed_members'] = $this->mergeMemberIds((array) ($metadata['managed_members'] ?? []), $userIds);
+            $project->metadata = $metadata;
+            $project->save();
+
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $metadata['expected_assignments'], [
+                'repair' => false,
+                // 刚写成功但远端列表可能短暂滞后：不能因为一次读不到就把新成员记成失败。
+                'known_present' => $userIds,
+            ]);
+
+            return [
+                'project' => $result['project'],
+                'added' => $userIds,
+                'removed' => [],
+                'failures' => $result['assignment_failures'],
+            ];
+        });
+    }
+
+    /**
+     * 显式移除成员（写云效并从期望集合摘除）。
+     *
+     * @return array{project: YunxiaoProject, added: list<string>, removed: list<string>, failures: list<string>}
+     */
+    public function removeMember(int $tenantId, int $yunxiaoProjectId, string $userId): array
+    {
+        return TenantContext::runInTenant($tenantId, function () use ($tenantId, $yunxiaoProjectId, $userId): array {
+            $userId = trim($userId);
+
+            if ($userId === '') {
+                throw new YunxiaoConfigurationException('成员 ID 不能为空', YunxiaoConfigurationException::REASON_MEMBER_LIST_EMPTY);
+            }
+
+            $project = $this->find($tenantId, $yunxiaoProjectId);
+            $connection = $this->connections->find($tenantId, (int) $project->connection_id);
+
+            $this->client->removeMember($connection, (string) $project->external_project_id, $userId);
+
+            $metadata = (array) $project->metadata;
+            $expected = $this->withoutMemberIds((array) ($metadata['expected_assignments'] ?? []), [$userId]);
+            $metadata['expected_assignments'] = $expected;
+            $metadata['managed_members'] = $this->withoutMemberIds((array) ($metadata['managed_members'] ?? []), [$userId]);
+            $metadata['assignment_failures'] = $this->withoutMemberIds((array) ($metadata['assignment_failures'] ?? []), [$userId]);
+            $project->metadata = $metadata;
+            $project->save();
+
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected, ['repair' => false]);
+
+            return [
+                'project' => $result['project'],
+                'added' => [],
+                'removed' => [$userId],
+                'failures' => $result['assignment_failures'],
+            ];
+        });
+    }
+
+    /**
+     * 成员/PM 对账：补齐期望集合中缺失的成员；`prune=true` 时只移除
+     * 「平台添加过且已不在期望集合」的成员，手工在云效加入的成员永不被移除。
+     *
+     * @param  array{members?:list<string>, project_manager?:string|null, role_id?:string|null, prune?:bool}  $input
+     * @return array{project: YunxiaoProject, added: list<string>, removed: list<string>, failed_removals: list<string>, failures: list<string>}
+     */
+    public function syncMembers(int $tenantId, int $yunxiaoProjectId, array $input = []): array
+    {
+        return TenantContext::runInTenant($tenantId, function () use ($tenantId, $yunxiaoProjectId, $input): array {
+            $project = $this->find($tenantId, $yunxiaoProjectId);
+            $connection = $this->connections->find($tenantId, (int) $project->connection_id);
+            $metadata = (array) $project->metadata;
+
+            $hasExplicitExpected = array_key_exists('members', $input) || array_key_exists('project_manager', $input);
+            $expected = $hasExplicitExpected
+                ? $this->requestedAssignments($project, $input)
+                : $this->normalizeMemberIds((array) ($metadata['expected_assignments'] ?? []));
+
+            if ($expected === []) {
+                throw new YunxiaoConfigurationException(
+                    '成员期望集合为空：请显式传 members/project_manager，或先由建项写入 expected_assignments',
+                    YunxiaoConfigurationException::REASON_MEMBER_LIST_EMPTY,
+                );
+            }
+
+            $removed = [];
+            $failedRemovals = [];
+            $prune = (bool) ($input['prune'] ?? config('yunxiao.members.prune', false));
+
+            if ($prune) {
+                $managed = $this->normalizeMemberIds((array) ($metadata['managed_members'] ?? []));
+                $stale = array_values(array_diff($managed, $expected));
+
+                foreach ($stale as $staleUserId) {
+                    try {
+                        $this->client->removeMember($connection, (string) $project->external_project_id, $staleUserId);
+                        $removed[] = $staleUserId;
+                    } catch (\Throwable) {
+                        // 单个移除失败不放弃整轮：留在 managed_members 里，下次对账重试。
+                        $failedRemovals[] = $staleUserId;
+                    }
+                }
+
+                $metadata['managed_members'] = $this->withoutMemberIds($managed, $removed);
+            }
+
+            $project->metadata = $metadata;
+            $project->save();
+
+            $result = $this->verifyAssignments($tenantId, $project, $connection, $expected, [
+                'repair' => true,
+                'manager' => $hasExplicitExpected ? ($input['project_manager'] ?? null) : ($metadata['project_manager'] ?? null),
+                'role_id' => $input['role_id'] ?? null,
+            ]);
+
+            return [
+                'project' => $result['project'],
+                'added' => $result['added'],
+                'removed' => $removed,
+                'failed_removals' => $failedRemovals,
+                'failures' => $result['assignment_failures'],
+            ];
+        });
+    }
+
+    /**
+     * 核验成员并按需补齐（issue #44：resume / 建项后成员缺失时有修复路径）。
+     *
+     * 列表读不到时不补写（无法计算差集），按原口径记为失败。
+     *
      * @param  list<string>  $expected
-     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>}
+     * @param  array{repair?:bool, manager?:string|null, role_id?:string|null, known_present?:list<string>}  $options
+     * @return array{project:YunxiaoProject, created:bool, mapping_status:string, assignment_failures:list<string>, added:list<string>}
      */
     private function verifyAssignments(
         int $tenantId,
         YunxiaoProject $project,
         IntegrationConnection $connection,
         array $expected,
+        array $options = [],
+        bool $created = false,
     ): array {
+        $expected = $this->normalizeMemberIds($expected);
+        $manager = trim((string) ($options['manager'] ?? ''));
+        $manager = $manager === '' ? null : $manager;
+        $repair = (bool) ($options['repair'] ?? config('yunxiao.members.auto_repair', true));
+        $knownPresent = $this->normalizeMemberIds((array) ($options['known_present'] ?? []));
+        $added = [];
         $failures = [];
+        $present = null;
 
         if ($expected !== []) {
             try {
-                $members = $this->client->listMembers($connection, (string) $project->external_project_id);
-                $present = array_map(
-                    static fn (array $member): string => (string) ($member['id'] ?? ''),
-                    $members,
+                $present = array_merge(
+                    array_map(
+                        static fn (array $member): string => (string) ($member['id'] ?? ''),
+                        $this->client->listMembers($connection, (string) $project->external_project_id),
+                    ),
+                    $knownPresent,
                 );
-                $failures = array_values(array_filter(
-                    $expected,
-                    static fn (string $memberId): bool => ! in_array($memberId, $present, true),
-                ));
             } catch (\Throwable) {
                 $failures = $expected;
+            }
+
+            if ($present !== null) {
+                $missing = array_values(array_diff($expected, $present));
+
+                if ($missing !== [] && $repair) {
+                    [$added, $failures] = $this->addMissingMembers(
+                        $connection,
+                        $project,
+                        $missing,
+                        $manager,
+                        $options['role_id'] ?? null,
+                    );
+                } else {
+                    $failures = $missing;
+                }
             }
         }
 
         $metadata = (array) $project->metadata;
 
-        if ($failures !== []) {
+        if ($expected !== []) {
+            $metadata['expected_assignments'] = $expected;
+        }
+
+        if ($manager !== null) {
+            $metadata['project_manager'] = $manager;
+        }
+
+        if ($added !== []) {
+            $metadata['managed_members'] = $this->mergeMemberIds((array) ($metadata['managed_members'] ?? []), $added);
+        }
+
+        $mappingPending = $project->isMappingPending();
+
+        if ($mappingPending) {
+            // 映射未补齐时保持 creation_failed：成员核验不能把 pending 项目改成 active。
+            $project->status = YunxiaoProject::STATUS_CREATION_FAILED;
+
+            if ($failures !== []) {
+                $metadata['assignment_failures'] = $failures;
+            } else {
+                unset($metadata['assignment_failures']);
+            }
+        } elseif ($failures !== []) {
             $project->status = YunxiaoProject::STATUS_PARTIAL;
             $metadata['assignment_failures'] = $failures;
-            $project->metadata = $metadata;
-            $project->save();
+        } else {
+            $project->status = YunxiaoProject::STATUS_ACTIVE;
+            unset($metadata['assignment_failures']);
+        }
 
+        $project->metadata = $metadata;
+        $project->save();
+
+        if (! $mappingPending && $failures !== []) {
             Event::dispatch(new YunxiaoProjectPartial(
                 $tenantId,
                 (int) $project->project_id,
@@ -349,12 +611,7 @@ class YunxiaoProjectService
                 'assignment_failed',
                 $failures,
             ));
-        } else {
-            $project->status = YunxiaoProject::STATUS_ACTIVE;
-            unset($metadata['assignment_failures']);
-            $project->metadata = $metadata;
-            $project->save();
-
+        } elseif (! $mappingPending) {
             Event::dispatch(new YunxiaoProjectCreated(
                 $tenantId,
                 (int) $project->project_id,
@@ -367,10 +624,106 @@ class YunxiaoProjectService
 
         return [
             'project' => $project->refresh(),
-            'created' => true,
+            'created' => $created,
             'mapping_status' => 'ok',
             'assignment_failures' => $failures,
+            'added' => $added,
         ];
+    }
+
+    /**
+     * 补齐缺失成员：负责人用管理员角色单独添加，其余用成员角色批量添加。
+     *
+     * @param  list<string>  $missing
+     * @return array{0: list<string>, 1: list<string>} [已添加, 失败]
+     */
+    private function addMissingMembers(
+        IntegrationConnection $connection,
+        YunxiaoProject $project,
+        array $missing,
+        ?string $manager,
+        ?string $roleId,
+    ): array {
+        $externalProjectId = (string) $project->external_project_id;
+        $added = [];
+        $failed = [];
+
+        if ($manager !== null && in_array($manager, $missing, true)) {
+            try {
+                $this->client->addMembers($connection, $externalProjectId, [$manager], [
+                    'role_id' => $this->managerRoleId($roleId),
+                ]);
+                $added[] = $manager;
+            } catch (\Throwable) {
+                $failed[] = $manager;
+            }
+        }
+
+        $members = $manager === null ? $missing : array_values(array_diff($missing, [$manager]));
+
+        if ($members !== []) {
+            try {
+                $this->client->addMembers($connection, $externalProjectId, $members, [
+                    'role_id' => $this->memberRoleId($roleId),
+                ]);
+                $added = array_merge($added, $members);
+            } catch (\Throwable) {
+                $failed = array_merge($failed, $members);
+            }
+        }
+
+        return [$added, $failed];
+    }
+
+    private function memberRoleId(?string $explicit): string
+    {
+        $explicit = trim((string) $explicit);
+
+        return $explicit !== '' ? $explicit : (string) config('yunxiao.members.role_id', 'project.participant');
+    }
+
+    private function managerRoleId(?string $explicit): string
+    {
+        $explicit = trim((string) $explicit);
+
+        return $explicit !== '' ? $explicit : (string) config('yunxiao.members.manager_role_id', 'project.admin');
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ids
+     * @return list<string>
+     */
+    private function normalizeMemberIds(array $ids): array
+    {
+        $normalized = array_map(static fn ($id): string => trim((string) $id), array_values($ids));
+
+        return array_values(array_unique(array_filter($normalized, static fn (string $id): bool => $id !== '')));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ids
+     * @param  list<string>  $additions
+     * @return list<string>
+     */
+    private function mergeMemberIds(array $ids, array $additions): array
+    {
+        return $this->normalizeMemberIds(array_merge(
+            $this->normalizeMemberIds($ids),
+            $this->normalizeMemberIds($additions),
+        ));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ids
+     * @param  list<string>  $removals
+     * @return list<string>
+     */
+    private function withoutMemberIds(array $ids, array $removals): array
+    {
+        return $this->normalizeMemberIds(array_values(array_diff(
+            $this->normalizeMemberIds($ids),
+            $this->normalizeMemberIds($removals),
+        )));
     }
 
     /**
@@ -444,6 +797,32 @@ class YunxiaoProjectService
         }
 
         return array_values(array_unique($members));
+    }
+
+    /**
+     * 合并调用方输入与既有期望集合：缺省的键继承 metadata，避免部分更新意外清空成员。
+     *
+     * @param  array<string, mixed>  $input
+     * @return list<string>
+     */
+    private function requestedAssignments(YunxiaoProject $project, array $input): array
+    {
+        $metadata = (array) $project->metadata;
+        $storedExpected = $this->normalizeMemberIds((array) ($metadata['expected_assignments'] ?? []));
+        $storedManager = trim((string) ($metadata['project_manager'] ?? ''));
+
+        $manager = array_key_exists('project_manager', $input)
+            ? trim((string) ($input['project_manager'] ?? ''))
+            : $storedManager;
+
+        $members = array_key_exists('members', $input)
+            ? array_values(array_map('strval', (array) ($input['members'] ?? [])))
+            : array_values(array_diff($storedExpected, $storedManager === '' ? [] : [$storedManager]));
+
+        return $this->expectedAssignments([
+            'project_manager' => $manager,
+            'members' => $members,
+        ]);
     }
 
     private function projectMapping(int $tenantId, int $hostProjectId): ?ExternalMapping

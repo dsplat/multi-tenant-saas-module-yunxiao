@@ -41,6 +41,8 @@ final class YunxiaoConfigurationException extends YunxiaoException
 
     public const REASON_PROJECT_NOT_FOUND = 'project_not_found';
 
+    public const REASON_MEMBER_LIST_EMPTY = 'member_list_empty';
+
     public function __construct(string $message, public readonly string $reason = 'configuration_error')
     {
         parent::__construct($message, 422);

@@ -43,8 +43,8 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         'writeback.view' => ['view', '查看写回记录'],
         'writeback.retry' => ['manage', '重试/死信处理'],
         'template_map.manage' => ['manage', '模板/状态映射'],
-        // P1：仅注册能力点，P0 不提供成员同步端点
-        'member.sync' => ['manage', '成员同步（P1）'],
+        // issue #44：成员写操作（添加/移除/对账）
+        'member.sync' => ['manage', '成员同步'],
     ];
 
     /** 旧脚手架能力点兼容别名：list/read → view，create/update/delete → manage */
@@ -89,14 +89,14 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         foreach (self::CAPABILITIES as $suffix => [$permission, $description]) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.'.$suffix,
+                'common.yunxiao.' . $suffix,
             );
         }
 
         foreach (self::COMPAT_ALIASES as $action => $permission) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.'.$action,
+                'common.yunxiao.' . $action,
             );
         }
 

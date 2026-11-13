@@ -170,11 +170,64 @@ class RegionYunxiaoClient implements YunxiaoClientContract
 
         return array_values(array_map(
             static fn (array $item): array => [
-                'id' => (string) ($item['id'] ?? $item['identifier'] ?? $item['userId'] ?? $item['user_id'] ?? $item['account'] ?? ''),
-                'name' => (string) ($item['name'] ?? $item['displayName'] ?? $item['display_name'] ?? ''),
+                'id' => (string) ($item['userId'] ?? $item['user_id'] ?? $item['id'] ?? $item['identifier'] ?? $item['account'] ?? ''),
+                'name' => (string) ($item['userName'] ?? $item['user_name'] ?? $item['name'] ?? $item['displayName'] ?? $item['display_name'] ?? ''),
             ],
             $this->itemsOf($data),
         ));
+    }
+
+    public function addMembers(IntegrationConnection $connection, string $externalProjectId, array $userIds, array $options = []): void
+    {
+        $ids = $this->memberIds($userIds);
+
+        if ($ids === []) {
+            return;
+        }
+
+        $this->requestVoid(
+            $connection,
+            'POST',
+            self::PATH_PREFIX . '/projects/' . rawurlencode($externalProjectId) . '/members',
+            [],
+            array_filter([
+                'roleId' => $options['role_id'] ?? null,
+                'userIds' => $ids,
+                'operatorId' => $options['operator_id'] ?? null,
+            ], static fn ($value): bool => $value !== null && $value !== ''),
+        );
+    }
+
+    public function removeMember(IntegrationConnection $connection, string $externalProjectId, string $userId, array $options = []): void
+    {
+        $userId = trim($userId);
+
+        if ($userId === '') {
+            return;
+        }
+
+        $this->requestVoid(
+            $connection,
+            'DELETE',
+            self::PATH_PREFIX . '/projects/' . rawurlencode($externalProjectId) . '/members',
+            [],
+            array_filter([
+                'userId' => $userId,
+                'roleIds' => $this->memberIds((array) ($options['role_ids'] ?? [])),
+                'operatorId' => $options['operator_id'] ?? null,
+            ], static fn ($value): bool => $value !== null && $value !== '' && $value !== []),
+        );
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $userIds
+     * @return list<string>
+     */
+    private function memberIds(array $userIds): array
+    {
+        $ids = array_map(static fn ($id): string => trim((string) $id), array_values($userIds));
+
+        return array_values(array_unique(array_filter($ids, static fn (string $id): bool => $id !== '')));
     }
 
     /**
@@ -193,7 +246,25 @@ class RegionYunxiaoClient implements YunxiaoClientContract
     }
 
     /**
+     * 无响应体的写接口（云效 ProjectMember 增删返回空响应）。
+     *
+     * @param  array<string, mixed>  $query
+     * @param  array<string, mixed>|null  $body
+     */
+    private function requestVoid(
+        IntegrationConnection $connection,
+        string $method,
+        string $path,
+        array $query = [],
+        ?array $body = null,
+    ): void {
+        $this->requestWithMeta($connection, $method, $path, $query, $body, true);
+    }
+
+    /**
      * 同 request()，并返回响应头（列表分页用 `x-total`）。
+     *
+     * `$allowEmpty` 仅用于无响应体的写接口：成功时 `json()` 为 null，不能当作解析失败。
      *
      * @param  array<string, mixed>  $query
      * @param  array<string, mixed>|null  $body
@@ -205,6 +276,7 @@ class RegionYunxiaoClient implements YunxiaoClientContract
         string $path,
         array $query = [],
         ?array $body = null,
+        bool $allowEmpty = false,
     ): array {
         $baseUrl = $connection->base_url ?: (string) config('yunxiao.api.base_url');
         $baseUrl = $this->guard->assertSafe($baseUrl);
@@ -234,6 +306,8 @@ class RegionYunxiaoClient implements YunxiaoClientContract
                 'GET' => $pending->get($url, $query),
                 'POST' => $pending->post($url, $body ?? []),
                 'PUT' => $pending->put($url, $body ?? []),
+                // 云效删除项目成员是 DELETE + body，不是路径参数。
+                'DELETE' => $pending->delete($url, $body ?? []),
                 default => throw new YunxiaoApiException('不支持的云效请求方法', 500, YunxiaoApiException::REASON_UNKNOWN),
             };
         } catch (ConnectionException) {
@@ -246,6 +320,10 @@ class RegionYunxiaoClient implements YunxiaoClientContract
         }
 
         $json = $response->json();
+
+        if ($json === null && $allowEmpty) {
+            return [[], $response->headers()];
+        }
 
         if (! is_array($json)) {
             throw new YunxiaoApiException('云效 API 返回内容无法解析', 502, YunxiaoApiException::REASON_UNKNOWN);

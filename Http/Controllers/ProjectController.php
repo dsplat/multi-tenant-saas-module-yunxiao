@@ -48,6 +48,8 @@ class ProjectController extends BaseController
             'created' => $result['created'],
             'mapping_status' => $result['mapping_status'],
             'assignment_failures' => $result['assignment_failures'],
+            // issue #44：建项/幂等重入时自动补齐的成员（空数组表示无需补写）。
+            'added' => array_values((array) ($result['added'] ?? [])),
         ], $result['created'] ? '云效项目已创建' : '云效项目已存在（幂等返回）');
     }
 
