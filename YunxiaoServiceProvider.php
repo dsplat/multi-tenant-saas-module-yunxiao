@@ -17,11 +17,13 @@ use MultiTenantSaas\Modules\Yunxiao\Console\Commands\SyncWorkitemsCommand;
 use MultiTenantSaas\Modules\Yunxiao\Console\Commands\VerifyTemplateCommand;
 use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoAccountClientContract;
 use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoClientContract;
+use MultiTenantSaas\Modules\Yunxiao\Contracts\YunxiaoFlowClientContract;
 use MultiTenantSaas\Modules\Yunxiao\Services\PlatformYunxiaoClient;
 use MultiTenantSaas\Modules\Yunxiao\Services\ProjexYunxiaoClient;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoProgressSummaryHandler;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWorkitemQueryHandler;
 use MultiTenantSaas\Modules\Yunxiao\Services\Tools\YunxiaoWritebackCommentDraftHandler;
+use MultiTenantSaas\Modules\Yunxiao\Services\YunxiaoFlowClient;
 use MultiTenantSaas\Modules\Yunxiao\Support\YunxiaoUrlGuard;
 
 /**
@@ -64,6 +66,7 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
     {
         $this->app->bind(YunxiaoClientContract::class, ProjexYunxiaoClient::class);
         $this->app->bind(YunxiaoAccountClientContract::class, PlatformYunxiaoClient::class);
+        $this->app->bind(YunxiaoFlowClientContract::class, YunxiaoFlowClient::class);
         $this->app->singleton(YunxiaoUrlGuard::class);
     }
 
@@ -94,14 +97,14 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         foreach (self::CAPABILITIES as $suffix => [$permission, $description]) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.' . $suffix,
+                'common.yunxiao.'.$suffix,
             );
         }
 
         foreach (self::COMPAT_ALIASES as $action => $permission) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.' . $action,
+                'common.yunxiao.'.$action,
             );
         }
 
