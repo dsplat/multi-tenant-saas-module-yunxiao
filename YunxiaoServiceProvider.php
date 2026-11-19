@@ -44,6 +44,8 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         'project.create' => ['manage', 'H1 建项目'],
         'workitem.view' => ['view', '查看工作项投影'],
         'workitem.sync' => ['manage', '手动触发同步'],
+        // issue #1：需求导入云效（创建工作项）
+        'workitem.import' => ['manage', '需求导入云效（创建工作项）'],
         'writeback.view' => ['view', '查看写回记录'],
         'writeback.retry' => ['manage', '重试/死信处理'],
         'template_map.manage' => ['manage', '模板/状态映射'],
@@ -97,14 +99,14 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         foreach (self::CAPABILITIES as $suffix => [$permission, $description]) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.'.$suffix,
+                'common.yunxiao.' . $suffix,
             );
         }
 
         foreach (self::COMPAT_ALIASES as $action => $permission) {
             $this->registerCapability(
                 $registry,
-                'common.yunxiao.'.$action,
+                'common.yunxiao.' . $action,
             );
         }
 
@@ -115,6 +117,7 @@ class YunxiaoServiceProvider extends ModuleServiceProvider
         $requirements->register('common.yunxiao.project.create', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
         $requirements->register('common.yunxiao.workitem.view', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.view']);
         $requirements->register('common.yunxiao.workitem.sync', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
+        $requirements->register('common.yunxiao.workitem.import', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
         $requirements->register('common.yunxiao.writeback.view', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.view']);
         $requirements->register('common.yunxiao.writeback.retry', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);
         $requirements->register('common.yunxiao.template_map.manage', ExecutionIdentity::TYPE_OPERATOR, ['permission' => 'yunxiao.manage']);

@@ -236,6 +236,53 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
         ];
     }
 
+    public function createWorkitem(IntegrationConnection $connection, string $externalProjectId, array $payload): array
+    {
+        // 云效 CreateWorkitem：spaceId / subject / assignedTo / workitemTypeId 必填；
+        // priority 不是顶层字段，走 customFieldValues.priority（字段值 ID）。
+        // status 也不在创建 body 内，由调用方创建成功后再 updateWorkitem。
+        $customFieldValues = [];
+
+        foreach ((array) ($payload['custom_field_values'] ?? $payload['customFieldValues'] ?? []) as $fieldId => $value) {
+            $fieldId = trim((string) $fieldId);
+
+            if ($fieldId === '' || $value === null || $value === '' || $value === []) {
+                continue;
+            }
+
+            $customFieldValues[$fieldId] = is_array($value)
+                ? implode(',', array_map(static fn ($item): string => (string) $item, $value))
+                : (string) $value;
+        }
+
+        $priority = $payload['priority'] ?? null;
+
+        if (is_string($priority) && trim($priority) !== '') {
+            $customFieldValues['priority'] = trim($priority);
+        }
+
+        $body = array_filter([
+            'spaceId' => trim($externalProjectId),
+            'subject' => $payload['title'] ?? $payload['subject'] ?? null,
+            'description' => $payload['description'] ?? null,
+            'assignedTo' => $payload['assigned_to'] ?? $payload['assignedTo'] ?? null,
+            'workitemTypeId' => $payload['workitem_type_id'] ?? $payload['workitemTypeId'] ?? null,
+            'parentId' => $payload['parent_id'] ?? $payload['parentId'] ?? null,
+            'formatType' => $payload['format_type'] ?? $payload['formatType'] ?? null,
+            'customFieldValues' => $customFieldValues !== [] ? $customFieldValues : null,
+        ], static fn ($value): bool => $value !== null && $value !== '' && $value !== []);
+
+        $data = $this->request(
+            $connection,
+            'POST',
+            $this->pathPrefix($connection) . '/workitems',
+            [],
+            $body,
+        );
+
+        return $this->normalizeWorkitem($this->firstOf($data));
+    }
+
     public function getWorkitem(IntegrationConnection $connection, string $externalWorkitemId): array
     {
         $data = $this->request($connection, 'GET', $this->pathPrefix($connection) . '/workitems/' . rawurlencode($externalWorkitemId));

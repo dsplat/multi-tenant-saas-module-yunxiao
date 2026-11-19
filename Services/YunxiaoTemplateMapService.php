@@ -231,6 +231,27 @@ class YunxiaoTemplateMapService
     }
 
     /**
+     * 需求导入时按模板 ID 取工作项类型映射（宿主类型 => 云效工作项类型 ID）。
+     *
+     * @return array<string, string>
+     */
+    public function workitemTypeMapForProject(int $tenantId, YunxiaoProject $project): array
+    {
+        $map = TenantContext::runInTenant($tenantId, fn (): ?YunxiaoTemplateMap => YunxiaoTemplateMap::query()
+            ->where('tenant_id', $tenantId)
+            ->where('template_id', $project->template_id)
+            ->orderBy('is_default')
+            ->orderBy('template_map_id')
+            ->first());
+
+        if (! $map instanceof YunxiaoTemplateMap) {
+            return [];
+        }
+
+        return $this->stringMap((array) $map->workitem_type_map);
+    }
+
+    /**
      * 写回时按模板 ID 取状态映射（平台事件 => 云效状态 ID）。
      *
      * @return array<string, string>

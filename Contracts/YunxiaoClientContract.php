@@ -57,6 +57,20 @@ interface YunxiaoClientContract
     public function listWorkitems(IntegrationConnection $connection, string $externalProjectId, array $query = []): array;
 
     /**
+     * 创建工作项（需求/任务/缺陷等；`POST /workitems`）。
+     *
+     * 云效必填：`spaceId`（externalProjectId）、`subject`、`assignedTo`、`workitemTypeId`。
+     * `priority` 不是顶层字段，实现写入 `customFieldValues.priority`（值为云效字段值 ID）。
+     * `status` 不在创建 body 内：调用方拿 `external_workitem_id` 后再调 updateWorkitem。
+     *
+     * @param  array<string, mixed>  $payload  title|subject / description / assigned_to|assignedTo /
+     *                                         workitem_type_id|workitemTypeId / priority /
+     *                                         custom_field_values / parent_id
+     * @return array<string, mixed> 归一化工作项，至少含 external_workitem_id
+     */
+    public function createWorkitem(IntegrationConnection $connection, string $externalProjectId, array $payload): array;
+
+    /**
      * @return array<string, mixed>
      */
     public function getWorkitem(IntegrationConnection $connection, string $externalWorkitemId): array;

@@ -10,6 +10,7 @@ use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectMemberController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\SyncController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\TemplateMapController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\WorkitemController;
+use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\WorkitemImportController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\WritebackController;
 
 /*
@@ -70,6 +71,10 @@ Route::prefix('yunxiao')->middleware('operator.identify')->group(function (): vo
         ->middleware('capability:common.yunxiao.workitem.view');
     Route::put('workitems/{id}', [WorkitemController::class, 'update'])
         ->middleware('capability:common.yunxiao.workitem.view');
+
+    // 需求导入云效（issue #1）：创建工作项，逐条幂等/可重试；写操作用 workitem.import。
+    Route::post('projects/{id}/workitems/import', [WorkitemImportController::class, 'store'])
+        ->middleware('capability:common.yunxiao.workitem.import');
 
     // 手动同步
     Route::post('sync', [SyncController::class, 'store'])

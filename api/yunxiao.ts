@@ -196,6 +196,73 @@ export interface YunxiaoWorkitemDetail {
   error: string | null
 }
 
+/** 需求导入云效（issue #1） */
+export type YunxiaoWorkitemImportStatus = 'created' | 'replayed' | 'failed' | 'uncertain' | 'dry_run'
+
+export interface YunxiaoWorkitemImportItemPayload {
+  /** 业务幂等键；缺省由归一化 payload 派生 */
+  idempotency_key?: string
+  title: string
+  description?: string | null
+  /** 云效 userId，可被顶层 assigned_to 兜底 */
+  assigned_to?: string | null
+  assignedTo?: string | null
+  workitem_type_id?: string | null
+  workitemTypeId?: string | null
+  /** 宿主工作项类型键；由模板映射解析为 workitem_type_id */
+  workitem_type?: string | null
+  /** 业务优先级别名（需 priority_map）或云效优先级字段值 ID */
+  priority?: string | null
+  /** 云效状态 ID；创建后补写 */
+  status_id?: string | null
+  statusId?: string | null
+  parent_id?: string | null
+  parentId?: string | null
+  custom_field_values?: Record<string, string | string[]>
+  customFieldValues?: Record<string, string | string[]>
+}
+
+export interface YunxiaoWorkitemImportPayload {
+  items: YunxiaoWorkitemImportItemPayload[]
+  assigned_to?: string | null
+  workitem_type_id?: string | null
+  workitem_type?: string | null
+  priority?: string | null
+  status_id?: string | null
+  dry_run?: boolean
+  /** 显式重试「远端已发起但未回填」的 pending 行（可能重复创建，默认 false） */
+  retry_pending?: boolean
+}
+
+export interface YunxiaoWorkitemImportItemResult {
+  index: number
+  status: YunxiaoWorkitemImportStatus
+  idempotency_key: string | null
+  external_workitem_id: string | null
+  serial_number: string | null
+  workitem_type_id: string | null
+  assigned_to: string | null
+  status_applied: boolean
+  warning: string | null
+  reason: string | null
+  error: string | null
+  attempts: number
+}
+
+export interface YunxiaoWorkitemImportResult {
+  yunxiao_project_id: number
+  external_project_id: string
+  dry_run: boolean
+  requested: number
+  created: number
+  replayed: number
+  failed: number
+  uncertain: number
+  dry_run_items: number
+  partial: boolean
+  items: YunxiaoWorkitemImportItemResult[]
+}
+
 export interface YunxiaoSyncStats {
   tenant_id: number
   connection_id: number
@@ -405,6 +472,22 @@ export async function syncYunxiaoWorkitems(payload: {
   dry_run?: boolean
 }): Promise<YunxiaoSyncStats> {
   const res = await http.post<YunxiaoSyncStats>(`${BASE}/sync`, payload)
+  return res.data
+}
+
+/**
+ * 需求导入云效（issue #1）：把 AI 拆解的业务需求写入云效工作项。
+ *
+ * `projectId` 是云效项目投影 ID（yunxiao_project_id）；逐条返回 created/replayed/failed/uncertain。
+ */
+export async function importYunxiaoWorkitems(
+  projectId: number,
+  payload: YunxiaoWorkitemImportPayload,
+): Promise<YunxiaoWorkitemImportResult> {
+  const res = await http.post<YunxiaoWorkitemImportResult>(
+    `${BASE}/projects/${projectId}/workitems/import`,
+    payload,
+  )
   return res.data
 }
 

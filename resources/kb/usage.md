@@ -3,7 +3,7 @@
 
 模块标识：`yunxiao`
 后台入口：Console → 云效集成（路由 `yunxiao`）
-数据表：`yunxiao_projects`、`yunxiao_workitems`、`yunxiao_template_maps`
+数据表：`yunxiao_projects`、`yunxiao_workitems`、`yunxiao_template_maps`、`yunxiao_workitem_imports`（需求导入账本）
 连接/映射/游标/写回：复用 Integration 标准表（`integration_connections`、`external_mappings`、
 `integration_sync_cursors`、`integration_sync_runs`、`integration_outbox_messages`）。
 
@@ -19,6 +19,8 @@
    按项目增量（Integration 游标 `resource=workitems`），分页 + 限流退避，部分页失败不回滚成功页。
 5. **查看投影与写回**：`GET /api/v1/yunxiao/workitems`、`GET /api/v1/yunxiao/writebacks`。
    工作项只读；未知状态原样保存并标 `unmapped`。详情实时拉取失败时回退缓存并标 `stale`。
+6. **需求导入云效**：`POST /api/v1/yunxiao/projects/{id}/workitems/import`，把 AI 拆解的业务需求
+   写入云效工作项；逐条幂等/可重试，成功后立即写本地投影（issue #1，详见下节）。
 
 ## 写回规则
 
@@ -40,6 +42,7 @@
 | `common.yunxiao.project.create` | `yunxiao.manage` | H1 建项目 |
 | `common.yunxiao.workitem.view` | `yunxiao.view` | 工作项投影 |
 | `common.yunxiao.workitem.sync` | `yunxiao.manage` | 手动同步 |
+| `common.yunxiao.workitem.import` | `yunxiao.manage` | 需求导入云效（创建工作项） |
 | `common.yunxiao.writeback.view` | `yunxiao.view` | 写回记录 |
 | `common.yunxiao.writeback.retry` | `yunxiao.manage` | 重试/死信 |
 | `common.yunxiao.template_map.manage` | `yunxiao.manage` | 模板/状态映射 |
@@ -58,10 +61,45 @@
 | POST | `connections/{id}/test`、`connections/{id}/rotate` | connection.manage |
 | GET/POST | `projects` | project.view / create |
 | GET | `workitems`、`workitems/{id}` | workitem.view |
+| POST | `projects/{id}/workitems/import` | workitem.import |
 | POST | `sync` | workitem.sync |
 | GET | `writebacks` | writeback.view |
 | POST | `writebacks/{id}/retry` | writeback.retry |
 | GET/POST/PUT | `template-maps` | template_map.manage |
+
+## 需求导入云效（issue #1）
+
+请求 `POST /api/v1/yunxiao/projects/{yunxiao_project_id}/workitems/import`：
+
+```json
+{
+  "assigned_to": "云效 userId（可被条目覆盖）",
+  "workitem_type_id": "云效工作项类型 ID（或用 workitem_type + 模板映射）",
+  "priority": "high（需 priority_map）或云效优先级字段值 ID",
+  "items": [
+    {
+      "idempotency_key": "宿主侧需求业务键",
+      "title": "客户需求 A",
+      "description": "由立项资料拆解",
+      "assigned_to": "云效 userId",
+      "workitem_type_id": "云效工作项类型 ID",
+      "status_id": "可选，创建后补写"
+    }
+  ],
+  "dry_run": false
+}
+```
+
+- 返回值逐条含 `status`（`created`/`replayed`/`failed`/`uncertain`/`dry_run`）、`external_workitem_id`、
+  `warning`、`reason`、`error`；单条失败不中断整批。
+- `idempotency_key` 缺省由归一化 payload 派生；同键同 payload 重放、同键异 payload 冲突；
+  `failed` 同键可重试；`pending`（远端已发起但未回填）返回 `uncertain`，默认不重试，
+  显式传 `retry_pending=true` 才重试（可能重复创建）。
+- 云效创建 body 不含 `status`，模块创建成功后补写；补写失败记 `warning=status_update_failed`，
+  重放时补做，不把已创建项标成失败。
+- `priority` 必须是云效优先级字段值 ID；传 `high` 等别名需在 `config('yunxiao.import.priority_map')`
+  配映射，未配置的别名原样透传并由云效 422 拒绝。
+- `dry_run=true` 只做校验与幂等判定，不外呼、不落账本。
 
 ## 命令
 
@@ -84,7 +122,7 @@ php artisan yunxiao:verify-template --tenant=1 [--dry-run]
 - base_url 保存前过 SSRF 守卫：默认仅 https + `devops.aliyuncs.com`，拒绝 localhost/私网/元数据地址；
 - 日志/异常/写回错误摘要均脱敏；不建 `yunxiao_connections`、`yunxiao_sync_cursors`、
   `yunxiao_workitem_mappings`；
-- 不提供工作项编辑、实际工时写入或构建触发。
+- 不提供工作项编辑、实际工时写入或构建触发；工作项创建仅经需求导入端点。
 
 ## P1 / 未实现
 

@@ -1,13 +1,13 @@
 # Yunxiao 集成（阿里云效连接器）
 
-云效项目、工作项与模板映射投影，把 GitLab 事件对账写回云效，并提供账号级组织发现/成员/部门/角色只读能力。连接、游标/outbox、inbox 全部复用 Integration，模块不建第二套连接或同步表。
+云效项目、工作项与模板映射投影，把 GitLab 事件对账写回云效，提供账号级组织发现/成员/部门/角色只读能力，并支持把 AI 拆解的业务需求导入云效工作项。连接、游标/outbox、inbox 全部复用 Integration，模块不建第二套连接或同步表。
 
 ## 分层与依赖
 
 - 架构层：`common`（`config/module-architecture.php`）
 - 依赖模块：`integration`
 - 冲突声明：无
-- 迁移：`2025_01_03_000019_yunxiao_module.php`（3 张投影表）、`2025_01_04_000019_yunxiao_module_data.php`（RBAC 权限，幂等）
+- 迁移：`2025_01_03_000019_yunxiao_module.php`（3 张投影表）、`2025_01_04_000019_yunxiao_module_data.php`（RBAC 权限，幂等）、`2026_11_19_000019_yunxiao_workitem_imports.php`（需求导入账本，issue #1）
 
 ## 配置 `config/yunxiao.php`
 
@@ -19,6 +19,7 @@
 | `members.role_id` / `manager_role_id` / `auto_repair` / `prune` | 成员对账：默认成员/负责人角色、缺失自动补齐、prune 默认开关（见「成员对账」） |
 | `sync.resource` / `rate_limit_backoff_ms` / `max_rate_limit_retries` / `detail_timeout` / `stale_minutes` | 游标资源名、限流退避、单条详情超时、投影过期阈值 |
 | `writeback.max_attempts` / `comment_template` / `comment_max_length` | 写回重试上限与评论模板 |
+| `import.max_items` / `import.priority_map` | 需求导入单批上限；业务优先级别名 → 云效优先级字段值 ID（见「需求导入云效」） |
 
 ## 路由（`api/v1/yunxiao`）
 
@@ -28,6 +29,7 @@
 - `projects/{id}/members`：成员列表（GET）、添加（POST）、移除（DELETE `/{userId}`）、
   按期望集合对账（POST `/sync`，issue #44）
 - `workitems`：列表、详情、更新
+- `projects/{id}/workitems/import`：需求导入云效（创建工作项，issue #1）
 - `sync`：手动同步工作项
 - `writebacks`：列表、`{id}/retry`（死信/失败重试）
 - `template-maps`：列表、创建、更新
@@ -38,7 +40,7 @@
 
 - `common.yunxiao.connection.view` / `connection.manage`
 - `common.yunxiao.project.view` / `project.create`
-- `common.yunxiao.workitem.view` / `workitem.sync`
+- `common.yunxiao.workitem.view` / `workitem.sync` / `workitem.import`（需求导入，写）
 - `common.yunxiao.template_map.manage`
 - `common.yunxiao.writeback.view` / `writeback.retry`
 - `common.yunxiao.member.sync`（成员添加/移除/对账）
@@ -71,6 +73,7 @@
 | 模板列表 | `GET /projectTemplates` | 返回 `[{id,name,type}]` |
 | 工作项列表 | `POST /workitems:search` | body `spaceId` / `category`=`Req,Task,Bug` / `page` / `perPage` / `orderBy` / `sort`；总数在 `x-total` 响应头 |
 | 工作项详情 / 更新 | `GET` / `PUT /workitems/{id}` | |
+| 工作项创建 | `POST /workitems` | body `spaceId` / `subject` / `assignedTo` / `workitemTypeId` 必填；`priority` 走 `customFieldValues.priority`；响应仅 `{id}` |
 | 工作项评论 | `POST /workitems/{id}/comments` | body `content` |
 | 项目成员列表 | `GET /projects/{id}/members` | 返回 `[{userId,userName,roleId,roleName,userAvatar}]`；可用 `name` / `roleId` 过滤 |
 | 添加项目成员 | `POST /projects/{id}/members` | body `roleId`（必填）+ `userIds[]`；成功**空响应体** |
@@ -128,6 +131,55 @@
   写操作**没有 outbox/幂等键**：远端已成功、本地落盘失败时重试可能重复提交；云效对
   「添加已存在成员」的返回行为未实测，调用方不要把 add 当作严格幂等。
 
+## 需求导入云效（issue #1）
+
+端点 `POST api/v1/yunxiao/projects/{id}/workitems/import`（`{id}` 是 `yunxiao_project_id`），
+受能力点 `common.yunxiao.workitem.import`（`yunxiao.manage`）保护。用于把 AI 拆解后的业务需求写入云效需求仓库。
+
+请求体：
+
+```json
+{
+  "assigned_to": "云效 userId（可被条目覆盖）",
+  "workitem_type_id": "云效工作项类型 ID（也可用 workitem_type + 模板映射解析）",
+  "priority": "high 或云效优先级字段值 ID",
+  "items": [
+    {
+      "idempotency_key": "需求在宿主侧的业务键",
+      "title": "客户需求 A",
+      "description": "由立项资料拆解……",
+      "assigned_to": "云效 userId",
+      "workitem_type_id": "云效工作项类型 ID",
+      "priority": "high",
+      "status_id": "可选；创建后补写"
+    }
+  ],
+  "dry_run": false,
+  "retry_pending": false
+}
+```
+
+响应逐条给出 `status`（`created` / `replayed` / `failed` / `uncertain` / `dry_run`）、
+`external_workitem_id`、`reason`、`error`、`attempts`，顶层汇总 `created` / `replayed` / `failed` /
+`uncertain` / `partial`。单条失败不中断整批。
+
+幂等与重试：
+
+- `idempotency_key` 是业务唯一键；缺省用归一化 payload 的 sha256 派生（`auto:<hash>`），同内容重试不会重复建。
+- 同键同 payload：`created` 直接 `replayed`；`failed` 同键重试；`pending`（调用远端前落账但未回填，通常是进程崩溃）
+  显式返回 `uncertain`，**不自动重试**（远端可能已创建）；确认需要重试时传 `retry_pending=true`。
+- 同键异 payload：`idempotency_key_conflict`，不覆盖原请求；修正后的需求请使用新的业务键。
+- 创建态先落 `yunxiao_workitem_imports` 账本，再调云效；成功后立即 upsert `yunxiao_workitems` 投影，
+  不等下一轮同步。`status_id` 不在云效创建 body 内，创建后 `PUT` 补写；补写失败只记
+  `warning=status_update_failed` 与 `metadata.status_pending=true`，重放时补做，不把已创建项标成失败。
+- `priority` 必须是云效优先级**字段值 ID**；传业务别名（如 `high`）时需在 `config('yunxiao.import.priority_map')`
+  配好映射，未配置的别名原样透传、由云效 422 拒绝（不猜测）。
+- `dry_run=true` 只做校验与幂等判定，不外呼、不写账本/投影。
+
+**未实测边界**：按云效官方 CreateWorkitem 文档实现，真实实例的优先级字段值 ID、需求类型 ID、
+`assignedTo` 权限与响应形状待下游升级 lock 后现场验收；请求/响应形状由
+`tests/Yunxiao/ProjexYunxiaoClientTest.php` 与 `tests/Yunxiao/YunxiaoWorkitemImportTest.php` 锁定。
+
 ## 同步与写回
 
 - 工作项同步按连接 + `integration_sync_cursors(resource=workitems)` 增量拉取，限流退避后重试；超过 `stale_minutes` 的投影标记为 stale。
@@ -137,7 +189,7 @@
 
 ## 数据表
 
-`yunxiao_projects`、`yunxiao_workitems`、`yunxiao_template_maps`。连接/凭据、游标、outbox、inbox、同步运行记录均在 Integration。
+`yunxiao_projects`、`yunxiao_workitems`、`yunxiao_template_maps`、`yunxiao_workitem_imports`（需求导入账本）。连接/凭据、游标、outbox、inbox、同步运行记录均在 Integration。
 
 ## 安全
 

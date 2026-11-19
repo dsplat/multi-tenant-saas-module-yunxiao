@@ -86,6 +86,24 @@ return [
     ],
 
     /*
+     * 需求导入云效（issue #1）
+     *
+     * 云效 CreateWorkitem 的 priority 不是顶层字段，而是 customFieldValues.priority，
+     * 值必须是「工作项类型字段配置」里的优先级字段值 ID（如 888853d622cc8eae793e085e27），
+     * 不是 high/medium 字面量。调用方既可直传字段值 ID，也可传业务别名；
+     * 别名必须在此映射到真实字段值 ID，未配置的别名原样透传（由云效 422 拒绝，不猜测）。
+     */
+    'import' => [
+        // 单次导入上限（表单与代码双重约束）
+        'max_items' => 100,
+        // 业务优先级别名 => 云效优先级字段值 ID
+        'priority_map' => [
+            // 'urgent' => '888853d622cc8eae793e085e27',
+            // 'high' => '888853d622cc8eae793e085e28',
+        ],
+    ],
+
+    /*
      * 项目成员对账（issue #44）
      *
      * 云效 CreateProjectMember（中心版 / Region 版）的 roleId 必填；这里给默认角色，
