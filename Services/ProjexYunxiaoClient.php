@@ -46,6 +46,13 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
      */
     private const WORKITEM_CATEGORIES = 'Req,Task,Bug';
 
+    /**
+     * 云效工作项大类全集（含风险 Risk；见 ListProjectWorkitemTypes）。
+     *
+     * @var list<string>
+     */
+    private const WORKITEM_CATEGORY_VALUES = ['Req', 'Task', 'Bug', 'Risk', 'Request', 'Topic'];
+
     public function __construct(
         private readonly Factory $http,
         private readonly YunxiaoUrlGuard $guard,
@@ -199,7 +206,7 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
         // Region 实例域工作项列表是 `POST workitems:search`（项目 GET 子资源不存在）；中心版同接口挂在 organizations 下。
         $body = [
             'spaceId' => $externalProjectId,
-            'category' => self::WORKITEM_CATEGORIES,
+            'category' => $this->workitemCategories($query['category'] ?? null),
             'page' => $page,
             'perPage' => $perPage,
             'orderBy' => 'gmtModified',
@@ -234,6 +241,34 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
             'has_more' => $hasMore,
             'total' => $total,
         ];
+    }
+
+    public function listSprints(IntegrationConnection $connection, string $externalProjectId, array $query = []): array
+    {
+        // 官方 ListSprints：`GET /projects/{id}/sprints`（中心版拼 organizations/{organizationId}）。
+        return $this->pagedList(
+            $connection,
+            $this->pathPrefix($connection) . '/projects/' . rawurlencode($externalProjectId) . '/sprints',
+            $query,
+            fn (array $item): array => $this->normalizeSprint($item),
+        );
+    }
+
+    public function listMilestones(IntegrationConnection $connection, string $externalProjectId, array $query = []): array
+    {
+        // 官方 ListMilestones：`GET /projects/{id}/milestones`。
+        return $this->pagedList(
+            $connection,
+            $this->pathPrefix($connection) . '/projects/' . rawurlencode($externalProjectId) . '/milestones',
+            $query,
+            fn (array $item): array => $this->normalizeMilestone($item),
+        );
+    }
+
+    public function listRisks(IntegrationConnection $connection, string $externalProjectId, array $query = []): array
+    {
+        // 云效没有独立风险资源：风险 = 工作项 `category=Risk`。
+        return $this->listWorkitems($connection, $externalProjectId, array_merge($query, ['category' => 'Risk']));
     }
 
     public function createWorkitem(IntegrationConnection $connection, string $externalProjectId, array $payload): array
@@ -386,6 +421,86 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
         $ids = array_map(static fn ($id): string => trim((string) $id), array_values($userIds));
 
         return array_values(array_unique(array_filter($ids, static fn (string $id): bool => $id !== '')));
+    }
+
+    /**
+     * 云效 GET 列表接口统一分页 + 归一化（迭代 / 里程碑）。
+     *
+     * 总数优先取 `x-total`；缺失时按「整页即可能还有下一页」保守判断。
+     *
+     * @param  array<string, mixed>  $query
+     * @param  callable(array<string, mixed>): array<string, mixed>  $normalize
+     * @return array{items: list<array<string, mixed>>, has_more: bool, total: int|null}
+     */
+    private function pagedList(IntegrationConnection $connection, string $path, array $query, callable $normalize): array
+    {
+        $page = max(1, (int) ($query['page'] ?? 1));
+        $perPage = max(1, (int) ($query['per_page'] ?? (int) config('yunxiao.api.page_size', 100)));
+
+        $params = ['page' => $page, 'perPage' => $perPage];
+
+        foreach (['status', 'name'] as $key) {
+            $value = $query[$key] ?? null;
+
+            if (is_array($value)) {
+                $value = implode(',', array_filter(array_map(static fn ($item): string => trim((string) $item), $value)));
+            } else {
+                $value = trim((string) $value);
+            }
+
+            if ($value !== '') {
+                $params[$key] = $value;
+            }
+        }
+
+        [$data, $headers] = $this->requestWithMeta($connection, 'GET', $path, $params);
+
+        $items = array_values(array_map($normalize, $this->itemsOf($data)));
+        $total = $this->totalFromHeaders($headers);
+
+        return [
+            'items' => $items,
+            'has_more' => $total !== null ? $page * $perPage < $total : count($items) >= $perPage,
+            'total' => $total,
+        ];
+    }
+
+    /**
+     * 工作项大类过滤：缺省沿用 Req,Task,Bug；显式传入时逐项校验，不静默吞掉未知值。
+     *
+     * @throws YunxiaoConfigurationException 传入未知大类
+     */
+    private function workitemCategories(mixed $value): string
+    {
+        if ($value === null || $value === '' || $value === []) {
+            return self::WORKITEM_CATEGORIES;
+        }
+
+        $requested = is_array($value) ? $value : explode(',', (string) $value);
+        $categories = [];
+
+        foreach ($requested as $item) {
+            $trimmed = trim((string) $item);
+
+            if ($trimmed === '') {
+                continue;
+            }
+
+            $normalized = ucfirst(strtolower($trimmed));
+
+            if (! in_array($normalized, self::WORKITEM_CATEGORY_VALUES, true)) {
+                throw new YunxiaoConfigurationException(
+                    sprintf('不支持的工作项大类：%s（可选：%s）', $trimmed, implode(',', self::WORKITEM_CATEGORY_VALUES)),
+                    YunxiaoConfigurationException::REASON_INVALID_CATEGORY,
+                );
+            }
+
+            $categories[] = $normalized;
+        }
+
+        $categories = array_values(array_unique($categories));
+
+        return $categories === [] ? self::WORKITEM_CATEGORIES : implode(',', $categories);
     }
 
     /**
@@ -660,7 +775,135 @@ class ProjexYunxiaoClient implements YunxiaoClientContract
             'priority' => $this->pick($item, ['priority']),
             'iteration_id' => $this->pick($item, ['iterationId', 'iteration_id', 'sprintId']),
             'creator' => $this->pick($item, ['creator', 'creatorId', 'createdBy']),
+            'category' => $this->pick($item, ['category', 'categoryIdentifier', 'workitemCategoryIdentifier']),
+            // 截止日期可能是顶层字段，也可能落在自定义字段里；只取可解析的标量，聚合层再判空。
+            'due_date' => $this->pick($item, ['dueDate', 'due_date', 'planEndDate'])
+                ?? $this->customFieldValue($item, ['dueDate', 'due_date']),
         ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     * @param  list<string>  $keys
+     */
+    private function customFieldValue(array $item, array $keys): mixed
+    {
+        $fields = $item['customFieldValues'] ?? $item['custom_field_values'] ?? null;
+
+        if (! is_array($fields)) {
+            return null;
+        }
+
+        return $this->pick($fields, $keys);
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     * @return array<string, mixed>
+     */
+    private function normalizeSprint(array $item): array
+    {
+        $status = strtoupper(trim((string) $this->pick($item, ['status', 'state'])));
+
+        return [
+            'external_sprint_id' => (string) $this->pick($item, ['id', 'sprintId', 'sprint_id', 'identifier']),
+            'name' => (string) $this->pick($item, ['name', 'sprintName', 'sprint_name']),
+            'status' => $status !== '' ? $status : null,
+            'status_name' => $this->sprintStatusName($status),
+            'start_date' => $this->pick($item, ['startDate', 'start_date']),
+            'end_date' => $this->pick($item, ['endDate', 'end_date']),
+            'capacity_hours' => $this->pick($item, ['capacityHours', 'capacity_hours']),
+            'locked' => (bool) ($item['locked'] ?? false),
+            'description' => $this->pick($item, ['description']),
+            'owners' => $this->people($item['owners'] ?? []),
+            'creator' => $this->person($item['creator'] ?? null),
+            'modifier' => $this->person($item['modifier'] ?? null),
+            'gmt_created' => $this->pick($item, ['gmtCreate', 'gmt_created', 'createdAt']),
+            'gmt_modified' => $this->pick($item, ['gmtModified', 'gmt_modified', 'updatedAt']),
+        ];
+    }
+
+    /**
+     * 迭代状态 -> 中文名（官方定义：TODO 未开始 / DOING 进行中 / ARCHIVED 已完成）。
+     * 未知取值不猜，返回 null。
+     */
+    private function sprintStatusName(string $status): ?string
+    {
+        return match ($status) {
+            'TODO' => '未开始',
+            'DOING' => '进行中',
+            'ARCHIVED' => '已完成',
+            default => null,
+        };
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     * @return array<string, mixed>
+     */
+    private function normalizeMilestone(array $item): array
+    {
+        $status = $item['status'] ?? null;
+        $assignedTo = $item['assignedTo'] ?? $item['assigned_to'] ?? null;
+
+        return [
+            'external_milestone_id' => (string) $this->pick($item, ['id', 'milestoneId', 'milestone_id', 'identifier']),
+            'name' => (string) $this->pick($item, ['subject', 'name', 'title']),
+            'status_id' => is_array($status) ? ($status['id'] ?? null) : $this->pick($item, ['statusId', 'status_id']),
+            'status_name' => is_array($status) ? ($status['name'] ?? null) : $this->pick($item, ['statusName', 'status_name']),
+            'status_display_name' => is_array($status) ? ($status['displayName'] ?? $status['display_name'] ?? null) : null,
+            'status_name_en' => is_array($status) ? ($status['nameEn'] ?? $status['name_en'] ?? null) : null,
+            'plan_end_date' => $this->pick($item, ['planEndDate', 'plan_end_date']),
+            'actual_end_date' => $this->pick($item, ['actualEndDate', 'actual_end_date']),
+            'assigned_to' => is_array($assignedTo) ? ($assignedTo['id'] ?? null) : $assignedTo,
+            'assigned_to_name' => is_array($assignedTo) ? ($assignedTo['name'] ?? null) : null,
+            'description' => $this->pick($item, ['description']),
+            'creator' => $this->person($item['creator'] ?? null),
+            'gmt_created' => $this->pick($item, ['gmtCreate', 'gmt_created', 'createdAt']),
+            'gmt_modified' => $this->pick($item, ['gmtModified', 'gmt_modified', 'updatedAt']),
+        ];
+    }
+
+    /**
+     * @param  mixed  $value  `{id, name}` 形状的人员对象
+     * @return array{id: string, name: string}|null
+     */
+    private function person(mixed $value): ?array
+    {
+        if (! is_array($value)) {
+            return null;
+        }
+
+        $id = trim((string) ($value['id'] ?? $value['userId'] ?? $value['user_id'] ?? ''));
+        $name = trim((string) ($value['name'] ?? $value['displayName'] ?? $value['display_name'] ?? ''));
+
+        if ($id === '' && $name === '') {
+            return null;
+        }
+
+        return ['id' => $id, 'name' => $name];
+    }
+
+    /**
+     * @return list<array{id: string, name: string}>
+     */
+    private function people(mixed $value): array
+    {
+        if (! is_array($value)) {
+            return [];
+        }
+
+        $people = [];
+
+        foreach ($value as $item) {
+            $person = $this->person($item);
+
+            if ($person !== null) {
+                $people[] = $person;
+            }
+        }
+
+        return $people;
     }
 
     /**

@@ -28,6 +28,7 @@
 - `projects`：列表、创建（H1）
 - `projects/{id}/members`：成员列表（GET）、添加（POST）、移除（DELETE `/{userId}`）、
   按期望集合对账（POST `/sync`，issue #44）
+- `projects/{id}/sprints|milestones|risks|progress`：项目执行读取（GET，只读，issue #48）
 - `workitems`：列表、详情、更新
 - `projects/{id}/workitems/import`：需求导入云效（创建工作项，issue #1）
 - `sync`：手动同步工作项
@@ -71,7 +72,9 @@
 | 项目详情 | `GET /projects/{id}` | |
 | 建项目 | `POST /projects` | `templateId` 取 `projectTemplates` 的 `id`；实例版 create 契约待实测（见 BL-183） |
 | 模板列表 | `GET /projectTemplates` | 返回 `[{id,name,type}]` |
-| 工作项列表 | `POST /workitems:search` | body `spaceId` / `category`=`Req,Task,Bug` / `page` / `perPage` / `orderBy` / `sort`；总数在 `x-total` 响应头 |
+| 工作项列表 | `POST /workitems:search` | body `spaceId` / `category`（默认 `Req,Task,Bug`，可含 `Risk`/`Request`/`Topic`）/ `page` / `perPage` / `orderBy` / `sort`；总数在 `x-total` 响应头 |
+| 迭代列表 | `GET /projects/{id}/sprints` | 官方 `ListSprints`；`status`=`TODO,DOING,ARCHIVED` / `page` / `perPage`；总数在 `x-total` |
+| 里程碑列表 | `GET /projects/{id}/milestones` | 官方 `ListMilestones`；`status` / `page` / `perPage`；总数在 `x-total` |
 | 工作项详情 / 更新 | `GET` / `PUT /workitems/{id}` | |
 | 工作项创建 | `POST /workitems` | body `spaceId` / `subject` / `assignedTo` / `workitemTypeId` 必填；`priority` 走 `customFieldValues.priority`；响应仅 `{id}` |
 | 工作项评论 | `POST /workitems/{id}/comments` | body `content` |
@@ -106,6 +109,76 @@
 **operator 映射边界**：`operator_id ↔ 云效 user_id` 的映射表（`yunxiao_member_maps`）由宿主维护，本模块不做账号体系转换；
 下游用成员列表的 `email` / `name` 做「邮箱优先 + 姓名候选 + 管理员确认」，把映射后的云效 `userId` 传给
 `createProject.memberIds` 或项目成员接口。邮箱可能缺失（实测 3/6 无邮箱），不能只靠邮箱自动匹配。
+
+## 项目执行读取（issue #48）
+
+下游周报 / 进度告警需要读云效「计划与执行」数据；云效 projex 公开接口里：
+
+- 迭代：`ListSprints` —— `GET /projects/{id}/sprints`（中心版拼 `organizations/{organizationId}`）；
+- 里程碑：`ListMilestones` —— `GET /projects/{id}/milestones`；
+- 风险：**没有独立资源**，风险是工作项大类 `category=Risk`；
+- 项目进度：**没有统计接口**，由工作项聚合（官方 API 目录中也无 statistics/progress 端点）。
+
+路由（`{id}` 是 `yunxiao_project_id` 投影主键，不是云效项目 ID；外部 ID 只从本租户投影解析）：
+
+| 路由 | 返回 |
+|---|---|
+| `GET projects/{id}/sprints?status=DOING&page=1&per_page=20` | `data.sprints[]` + `has_more` + `total` |
+| `GET projects/{id}/milestones?status=…` | `data.milestones[]` + `has_more` + `total` |
+| `GET projects/{id}/risks` | `data.risks[]`（工作项形状）+ `has_more` + `total` |
+| `GET projects/{id}/progress` | `data.total` / `by_category` / `by_status` / `completion` / `overdue_count` / `truncated` / `partial` |
+
+四个只读路由复用能力点 `common.yunxiao.workitem.view`（`yunxiao.view`），不新增权限项。
+
+归一化字段（snake_case，稳定键）：
+
+- 迭代：`external_sprint_id / name / status / status_name / start_date / end_date /
+  capacity_hours / locked / description / owners[{id,name}] / creator{id,name} /
+  modifier{id,name} / gmt_created / gmt_modified`；
+  `status` 保留云效取值 `TODO|DOING|ARCHIVED`，`status_name` 映射为 未开始/进行中/已完成（未知取值回落 null）。
+- 里程碑：`external_milestone_id / name / status_id / status_name / status_display_name /
+  status_name_en / plan_end_date / actual_end_date / assigned_to / assigned_to_name /
+  description / creator / gmt_created / gmt_modified`。
+- 风险：与工作项一致，新增 `category`、`due_date` 两个归一化键（`due_date` 兼容顶层与自定义字段）。
+
+**进度聚合语义**（确定性优先，不猜状态含义）：
+
+1. 按 `categories`（默认 `Req,Task,Bug,Risk`）分别翻页 `workitems:search`，逐页累加；
+2. `by_status` 按 `status_id`（缺省用 `status_name`）计数，按 count 降序；
+3. 完成率只在「已完成状态集合」显式给出时计算：请求 `done_status_ids[]` /
+   `done_status_names[]`，或连接配置 `config.progress_done_status_ids` /
+   `progress_done_status_names`。都没有时 `completion.defined=false`、`rate=null`，
+   **不按状态名猜「完成」**（避免把「已完成待验收」误算为完成）；
+4. `overdue_count` 需要同一完成集合 + 工作项带可解析 `due_date`，否则 `null`；
+5. 单个 category 失败只标记 `partial=true` 并把原因写进 `errors.{category}`，其余 category 继续；
+6. 单类翻页达 `yunxiao.progress.max_pages`（默认 5）仍有下一页时 `truncated=true`，
+   计数只代表已读到的下界，下游不得当全量。
+
+请求参数：`categories[]`、`done_status_ids[]`、`done_status_names[]`、`page_size`、`max_pages`。
+
+**外呼样例（依据官方 API 参考；本仓未持真实 token，未做真实外呼实测）**：
+
+```bash
+# Region
+curl -X GET 'https://{org}.devops.aliyuncs.com/oapi/v1/projex/projects/{projectId}/sprints?status=TODO,DOING&page=1&perPage=20' \
+  -H 'x-yunxiao-token: pt-****'
+curl -X GET 'https://{org}.devops.aliyuncs.com/oapi/v1/projex/projects/{projectId}/milestones?page=1&perPage=20' \
+  -H 'x-yunxiao-token: pt-****'
+curl -X POST 'https://{org}.devops.aliyuncs.com/oapi/v1/projex/workitems:search' \
+  -H 'x-yunxiao-token: pt-****' -H 'Content-Type: application/json' \
+  -d '{"spaceId":"{projectId}","category":"Risk","page":1,"perPage":20}'
+```
+
+官方返回样例（节选，`ListSprints`）：
+
+```json
+[{"id":"1111","name":"sprint-test","status":"TODO","startDate":"","endDate":"",
+  "capacityHours":100,"locked":false,"owners":[{"id":"674d96...","name":"user-name-xxx"}]}]
+```
+
+配置：`yunxiao.progress.page_size`（100）/ `yunxiao.progress.max_pages`（5）。
+工作项上的 `iteration_id` 已归一化，下游要「按迭代看进度」时按该字段过滤即可
+（搜索接口的 sprint 维度过滤未在官方文档中确认，本模块不臆造该参数）。
 
 ## 成员对账（issue #44）
 

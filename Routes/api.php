@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Route;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ConnectionController;
+use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ExecutionController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\OrganizationController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectController;
 use MultiTenantSaas\Modules\Yunxiao\Http\Controllers\ProjectMemberController;
@@ -63,6 +64,16 @@ Route::prefix('yunxiao')->middleware('operator.identify')->group(function (): vo
         ->middleware('capability:common.yunxiao.member.sync');
     Route::delete('projects/{id}/members/{userId}', [ProjectMemberController::class, 'destroy'])
         ->middleware('capability:common.yunxiao.member.sync');
+
+    // 项目执行读取（issue #48）：迭代 / 里程碑 / 风险 / 进度，全部只读；复用 workitem.view。
+    Route::get('projects/{id}/sprints', [ExecutionController::class, 'sprints'])
+        ->middleware('capability:common.yunxiao.workitem.view');
+    Route::get('projects/{id}/milestones', [ExecutionController::class, 'milestones'])
+        ->middleware('capability:common.yunxiao.workitem.view');
+    Route::get('projects/{id}/risks', [ExecutionController::class, 'risks'])
+        ->middleware('capability:common.yunxiao.workitem.view');
+    Route::get('projects/{id}/progress', [ExecutionController::class, 'progress'])
+        ->middleware('capability:common.yunxiao.workitem.view');
 
     // 工作项投影（只读）
     Route::get('workitems', [WorkitemController::class, 'index'])

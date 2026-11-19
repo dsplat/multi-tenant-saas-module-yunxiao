@@ -104,6 +104,18 @@ return [
     ],
 
     /*
+     * 项目进度聚合（issue #48）
+     *
+     * 云效 projex 没有统计接口，进度由工作项按 category 翻页聚合。
+     * page_size / max_pages 限制单类翻页量，避免一次周报把整个项目全量拉穿；
+     * 触顶时结果带 truncated=true，计数只代表已读到的下界。
+     */
+    'progress' => [
+        'page_size' => 100,
+        'max_pages' => 5,
+    ],
+
+    /*
      * 项目成员对账（issue #44）
      *
      * 云效 CreateProjectMember（中心版 / Region 版）的 roleId 必填；这里给默认角色，
